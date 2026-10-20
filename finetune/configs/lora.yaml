@@ -1,0 +1,52 @@
+# LoRA fine-tune of the UNet attention layers. Good default for a style or a
+# subject with 10 to 100 images. Train on a GPU; export loads in ./sd.
+model:
+  base: models/sd15                 # the directory scripts/download_sd15.sh fills
+
+data:
+  path: data/my-images              # images + .txt captions or metadata.jsonl
+  resolution: 512
+  caption_dropout: 0.1
+  cache_latents: true               # fast when crops are fixed (center_crop: true)
+
+weights:
+  method: lora
+  unet:
+    train: true
+    # include: ["attn2"]            # cross-attention only: learns prompt->concept binding
+    # exclude: ["mid_block"]
+  text_encoder:
+    train: false                    # set true (lr 1e-5) to also adapt the prompt side
+    lr: 1.0e-5
+  lora:
+    rank: 16
+    alpha: 16
+    unet_targets: [to_q, to_k, to_v, to_out.0]
+
+train:
+  steps: 1500
+  batch_size: 2
+  grad_accum: 2
+  lr: 1.0e-4
+  lr_scheduler: cosine
+  warmup_steps: 50
+  precision: bf16                   # fp32 on CPU/MPS if unsupported
+  gradient_checkpointing: true
+  snr_gamma: 5.0
+  seed: 0
+
+checkpoint:
+  dir: runs/lora
+  every: 250
+  keep: 3
+
+logging:
+  every: 10
+  sample_every: 250
+  sample_prompts: ["a photo of a cat in the style of the training images"]
+
+export:
+  output_dir: models/sd15-lora
+  dtype: fp16
+  fuse_lora: true                   # ./sd needs merged weights
+  save_lora: true                   # also keep the small lora.safetensors

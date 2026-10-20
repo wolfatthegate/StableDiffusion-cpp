@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sdft"
+version = "0.1.0"
+description = "Configurable fine-tuning for Stable Diffusion 1.x, exporting weights that StableDiffusion-cpp can load"
+requires-python = ">=3.10"
+dependencies = [
+  "torch>=2.1", "diffusers>=0.27", "transformers>=4.38", "safetensors>=0.4",
+  "huggingface_hub>=0.20", "pyyaml>=6", "pillow>=10", "numpy>=1.24",
+]
+
+[project.scripts]
+sdft = "sdft.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["sdft*"]

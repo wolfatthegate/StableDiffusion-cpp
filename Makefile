@@ -1,10 +1,11 @@
 # StableDiffusion-cpp build.
-#   make              build ./sd
+#   make              build ./sd and ./sd-server
 #   make test         build and run the kernel tests (no weights needed)
 #   make test_tokenizer && ./test_tokenizer   tokenizer test (needs models/sd15)
 #   make ACCELERATE=1 use Apple's BLAS for gemm_nt (macOS only)
 #   make clean
-# Every source in src/ except main.cpp is shared by the binary and the tests.
+# Every source in src/ except main.cpp and server.cpp is shared by the
+# binaries and the tests.
 
 CXX      ?= clang++
 CXXFLAGS ?= -std=c++17 -O3 -Wall -Wextra -pthread
@@ -22,13 +23,16 @@ ifeq ($(ACCELERATE),1)
   LDFLAGS  += -framework Accelerate
 endif
 
-LIB_SRCS := $(filter-out src/main.cpp,$(wildcard src/*.cpp))
+LIB_SRCS := $(filter-out src/main.cpp src/server.cpp,$(wildcard src/*.cpp))
 LIB_OBJS := $(LIB_SRCS:src/%.cpp=build/%.o)
 HEADERS  := $(wildcard src/*.h)
 
-all: sd
+all: sd sd-server
 
 sd: $(LIB_OBJS) build/main.o
+	$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS)
+
+sd-server: $(LIB_OBJS) build/server.o
 	$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS)
 
 test_ops: $(LIB_OBJS) build/test_ops.o
@@ -49,7 +53,7 @@ build:
 	mkdir -p build
 
 clean:
-	rm -rf build sd test_ops test_tokenizer
+	rm -rf build sd sd-server test_ops test_tokenizer
 
 .PHONY: all test clean
 

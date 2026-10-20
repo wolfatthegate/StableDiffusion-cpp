@@ -54,8 +54,8 @@ void chunk(std::vector<uint8_t>& out, const char* type, const std::vector<uint8_
 
 }  // namespace
 
-void write_png(const std::string& path, int width, int height, const std::vector<uint8_t>& rgb) {
-    if (rgb.size() != (size_t)width * height * 3) throw std::runtime_error("write_png: buffer size mismatch");
+std::vector<uint8_t> encode_png(int width, int height, const std::vector<uint8_t>& rgb) {
+    if (rgb.size() != (size_t)width * height * 3) throw std::runtime_error("encode_png: buffer size mismatch");
 
     // Raw scanlines, each prefixed with filter type 0.
     std::vector<uint8_t> raw;
@@ -102,10 +102,30 @@ void write_png(const std::string& path, int width, int height, const std::vector
     chunk(png, "IHDR", ihdr);
     chunk(png, "IDAT", z);
     chunk(png, "IEND", {});
+    return png;
+}
 
+void write_png(const std::string& path, int width, int height, const std::vector<uint8_t>& rgb) {
+    std::vector<uint8_t> png = encode_png(width, height, rgb);
     std::ofstream out(path, std::ios::binary);
     if (!out) throw std::runtime_error("cannot write " + path);
     out.write((const char*)png.data(), (std::streamsize)png.size());
+}
+
+std::string base64_encode(const uint8_t* data, size_t n) {
+    static const char* tbl = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    std::string out;
+    out.reserve((n + 2) / 3 * 4);
+    for (size_t i = 0; i < n; i += 3) {
+        uint32_t v = (uint32_t)data[i] << 16;
+        if (i + 1 < n) v |= (uint32_t)data[i + 1] << 8;
+        if (i + 2 < n) v |= data[i + 2];
+        out += tbl[(v >> 18) & 63];
+        out += tbl[(v >> 12) & 63];
+        out += i + 1 < n ? tbl[(v >> 6) & 63] : '=';
+        out += i + 2 < n ? tbl[v & 63] : '=';
+    }
+    return out;
 }
 
 }  // namespace sd

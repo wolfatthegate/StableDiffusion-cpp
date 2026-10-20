@@ -1,0 +1,46 @@
+# Full fine-tune of selected UNet weights, with EMA. Needs a GPU with 24 GB or
+# more at 512 resolution. The include list limits training to the attention
+# blocks; remove it to train every UNet parameter.
+model:
+  base: models/sd15
+
+data:
+  path: data/my-images
+  resolution: 512
+  caption_dropout: 0.1
+  cache_latents: true
+
+weights:
+  method: full
+  unet:
+    train: true
+    lr: 2.0e-6
+    include: ["attn1", "attn2", "transformer_blocks"]
+    exclude: ["time_embedding"]
+  text_encoder:
+    train: false
+
+train:
+  steps: 3000
+  batch_size: 4
+  grad_accum: 1
+  lr: 2.0e-6
+  lr_scheduler: constant
+  warmup_steps: 100
+  precision: bf16
+  gradient_checkpointing: true
+  snr_gamma: 5.0
+  ema_decay: 0.999
+  seed: 0
+
+checkpoint:
+  dir: runs/full
+  every: 500
+  keep: 2
+
+logging:
+  every: 20
+
+export:
+  output_dir: models/sd15-full
+  dtype: fp16

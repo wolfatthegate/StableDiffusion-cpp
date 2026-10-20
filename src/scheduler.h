@@ -45,6 +45,10 @@ public:
     // Advances x in place from timestep `step` to the next one, given the
     // UNet's (guided) noise prediction eps.
     virtual void step(const Tensor& eps, int step, Tensor& x) const = 0;
+    // The clean latent x_0 implied by the current latent x and the noise
+    // prediction eps at step `step`. Used for live previews; x is not
+    // modified.
+    virtual Tensor predict_x0(const Tensor& x, const Tensor& eps, int step) const = 0;
 
 protected:
     // Builds alphas_cumprod_ for the scaled-linear schedule.
@@ -70,6 +74,7 @@ public:
     float init_noise_sigma() const override { return sigmas_.front(); }
     void scale_model_input(Tensor& x, int step) const override;
     void step(const Tensor& eps, int step, Tensor& x) const override;
+    Tensor predict_x0(const Tensor& x, const Tensor& eps, int step) const override;
 
 private:
     std::vector<float> sigmas_;  // steps + 1 entries; the last one is 0
@@ -84,6 +89,7 @@ public:
     // Timesteps 1 + k * (1000 / steps) for k = steps-1 down to 0.
     void set_timesteps(int steps) override;
     void step(const Tensor& eps, int step, Tensor& x) const override;
+    Tensor predict_x0(const Tensor& x, const Tensor& eps, int step) const override;
 
 private:
     int step_ratio_ = 50;  // 1000 / steps (integer division)
