@@ -1,3 +1,6 @@
+// ============================================================================
+// json.cpp - Recursive-descent JSON parser. See json.h.
+// ============================================================================
 #include "json.h"
 
 #include <cstdlib>
@@ -19,6 +22,8 @@ const Json& Json::at(const std::string& key) const {
 
 namespace {
 
+// Single-pass parser over a string; pos_ is the current byte offset.
+// One method per grammar rule: value() dispatches on the first character.
 class Parser {
 public:
     explicit Parser(const std::string& s) : s_(s) {}
@@ -37,6 +42,7 @@ private:
     [[noreturn]] void fail(const std::string& msg) {
         throw std::runtime_error("json: " + msg + " at offset " + std::to_string(pos_));
     }
+    // Skips JSON whitespace.
     void ws() {
         while (pos_ < s_.size() && (s_[pos_] == ' ' || s_[pos_] == '\n' || s_[pos_] == '\r' || s_[pos_] == '\t')) ++pos_;
     }
@@ -48,6 +54,7 @@ private:
         if (peek() != c) fail(std::string("expected '") + c + "'");
         ++pos_;
     }
+    // Consumes `lit` if the input continues with it.
     bool consume(const char* lit) {
         size_t n = 0;
         while (lit[n]) ++n;
@@ -58,6 +65,7 @@ private:
         return false;
     }
 
+    // Appends code point cp to out as UTF-8 (1 to 4 bytes).
     static void put_utf8(std::string& out, uint32_t cp) {
         if (cp < 0x80) {
             out += (char)cp;
@@ -76,6 +84,7 @@ private:
         }
     }
 
+    // Reads the 4 hex digits of a backslash-u (XXXX) escape.
     uint32_t hex4() {
         if (pos_ + 4 > s_.size()) fail("bad \\u escape");
         uint32_t v = 0;
@@ -90,6 +99,8 @@ private:
         return v;
     }
 
+    // Parses a quoted string, decoding escapes. A high surrogate followed by
+    // an escaped low surrogate is combined into one supplementary code point.
     std::string string() {
         expect('"');
         std::string out;
@@ -127,6 +138,8 @@ private:
         return out;
     }
 
+    // Parses any value: object, array, string, true/false/null, or number
+    // (numbers are delegated to strtod).
     Json value() {
         ws();
         Json v;

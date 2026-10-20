@@ -3,6 +3,7 @@
 # CLIP tokenizer files into a diffusers-style directory.
 #   usage: scripts/download_sd15.sh [target-dir]   (default: models/sd15)
 # Set HF_TOKEN if the repository ever requires authentication.
+# Downloads resume (curl -C -) if interrupted, so re-running is safe.
 set -eu
 DIR="${1:-models/sd15}"
 BASE="https://huggingface.co/stable-diffusion-v1-5/stable-diffusion-v1-5/resolve/main"

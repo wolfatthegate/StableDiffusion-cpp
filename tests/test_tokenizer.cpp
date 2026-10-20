@@ -1,3 +1,9 @@
+// ============================================================================
+// test_tokenizer.cpp - Checks CLIPTokenizer against token ids from the
+// vocab.json of openai/clip-vit-large-patch14: case folding, contractions,
+// digits, punctuation runs, empty input, and BOS/EOS/padding in encode().
+// Usage: ./test_tokenizer [model-dir]   (default models/sd15)
+// ============================================================================
 #include <cstdio>
 #include <string>
 #include <vector>
@@ -8,7 +14,7 @@ int main(int argc, char** argv) {
     std::string dir = argc > 1 ? argv[1] : "models/sd15";
     sd::CLIPTokenizer tok(dir + "/tokenizer/vocab.json", dir + "/tokenizer/merges.txt");
     struct Case { const char* text; std::vector<int32_t> want; };
-    // Reference ids from the HF CLIPTokenizer for openai/clip-vit-large-patch14.
+    // Expected ids, looked up in vocab.json of openai/clip-vit-large-patch14.
     const Case cases[] = {
         {"a photo of a cat", {320, 1125, 539, 320, 2368}},
         {"A Photo of a CAT", {320, 1125, 539, 320, 2368}},

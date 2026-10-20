@@ -1,3 +1,6 @@
+// ============================================================================
+// clip.cpp - CLIP text encoder forward pass. See clip.h for the architecture.
+// ============================================================================
 #include "clip.h"
 
 #include <stdexcept>
@@ -5,6 +8,8 @@
 namespace sd {
 
 namespace {
+// Checkpoints saved from CLIPTextModel use "text_model.*"; some conversions
+// drop the prefix. Returns whichever one this file uses.
 std::string prefix_for(const Weights& w) {
     if (w.has("text_model.embeddings.token_embedding.weight")) return "text_model.";
     if (w.has("embeddings.token_embedding.weight")) return "";
@@ -16,6 +21,7 @@ CLIPTextEncoder::CLIPTextEncoder(const Weights& w, int heads) : heads_(heads) {
     const std::string p = prefix_for(w);
     tok_emb_ = &w.get(p + "embeddings.token_embedding.weight");
     pos_emb_ = &w.get(p + "embeddings.position_embedding.weight");
+    // Bind encoder.layers.0, .1, ... until one is missing (12 for ViT-L/14).
     for (int i = 0;; ++i) {
         const std::string lp = p + "encoder.layers." + std::to_string(i);
         if (!w.has(lp + ".layer_norm1.weight")) break;
@@ -31,6 +37,7 @@ CLIPTextEncoder::CLIPTextEncoder(const Weights& w, int heads) : heads_(heads) {
 Tensor CLIPTextEncoder::forward(const std::vector<int32_t>& tokens) const {
     const int64_t S = (int64_t)tokens.size(), D = tok_emb_->dim(1);
     if (S > pos_emb_->dim(0)) throw std::runtime_error("CLIP: sequence longer than position table");
+    // Embedding: token vector + learned absolute position vector.
     Tensor x({1, S, D});
     for (int64_t s = 0; s < S; ++s) {
         const int32_t t = tokens[s];
@@ -40,6 +47,8 @@ Tensor CLIPTextEncoder::forward(const std::vector<int32_t>& tokens) const {
         float* o = x.ptr() + s * D;
         for (int64_t i = 0; i < D; ++i) o[i] = te[i] + pe[i];
     }
+    // Pre-norm transformer layers. The attention is causal: each token sees
+    // only itself and earlier tokens, as CLIP was trained.
     for (const Layer& L : layers_) {
         Tensor h = L.ln1(x);
         Tensor a = attention(L.q(h), L.k(h), L.v(h), heads_, /*causal=*/true);

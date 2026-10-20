@@ -1,4 +1,18 @@
-// sd: text-to-image with Stable Diffusion 1.x, CPU only, no dependencies.
+// ============================================================================
+// main.cpp - The `sd` command-line tool: text-to-image with Stable Diffusion
+// 1.x on the CPU, no dependencies.
+//
+// Pipeline:
+//   1. Tokenise the prompt and negative prompt, encode both with CLIP.
+//   2. Draw Gaussian latent noise of shape [1, 4, H/8, W/8].
+//   3. For each sampler step, run the UNet on [uncond, cond] as one batch of
+//      2, combine with classifier-free guidance, and step the sampler.
+//   4. Decode the latent with the VAE and write an RGB PNG.
+//
+// Each model's weights are loaded in their own scope and freed before the
+// next model is loaded, so peak memory is roughly the UNet in float32
+// (3.4 GB) plus activations.
+// ============================================================================
 #include <sys/stat.h>
 
 #include <algorithm>
@@ -22,6 +36,7 @@ using namespace sd;
 
 namespace {
 
+// Command-line options and their defaults.
 struct Options {
     std::string model_dir = "models/sd15";
     std::string prompt;
@@ -49,6 +64,7 @@ void usage() {
                  "  --output FILE         PNG path (default output.png)\n");
 }
 
+// Parses argv; prints usage and exits on --help or invalid input.
 Options parse_args(int argc, char** argv) {
     Options o;
     for (int i = 1; i < argc; ++i) {
@@ -97,7 +113,8 @@ bool file_exists(const std::string& p) {
     return stat(p.c_str(), &st) == 0;
 }
 
-// Prefers the full-precision file, falls back to the fp16 variant.
+// Returns <dir>/<sub>/<base>.safetensors if it exists, else the .fp16 variant;
+// exits with a message if neither exists.
 std::string find_weights(const std::string& dir, const std::string& sub, const std::string& base) {
     const std::string candidates[] = {dir + "/" + sub + "/" + base + ".safetensors",
                                       dir + "/" + sub + "/" + base + ".fp16.safetensors"};
@@ -107,6 +124,7 @@ std::string find_weights(const std::string& dir, const std::string& sub, const s
     std::exit(1);
 }
 
+// Monotonic wall-clock time in seconds, for progress timings.
 double now() {
     using namespace std::chrono;
     return duration<double>(steady_clock::now().time_since_epoch()).count();
@@ -124,6 +142,8 @@ int main(int argc, char** argv) try {
     CLIPTokenizer tokenizer(opt.model_dir + "/tokenizer/vocab.json", opt.model_dir + "/tokenizer/merges.txt");
     std::vector<int32_t> pos_ids = tokenizer.encode(opt.prompt);
     std::vector<int32_t> neg_ids = tokenizer.encode(opt.negative);
+    // With a guidance scale of exactly 1, CFG reduces to the conditional
+    // prediction, so the unconditional pass is skipped (half the work).
     const bool use_cfg = opt.cfg != 1.0f;
 
     Tensor context;
@@ -134,7 +154,8 @@ int main(int argc, char** argv) try {
         Tensor cond = clip.forward(pos_ids);
         if (use_cfg) {
             Tensor uncond = clip.forward(neg_ids);
-            context = concat_batch(uncond, cond);  // [uncond, cond]
+            // Batch order [uncond, cond] must match the slicing in the loop.
+            context = concat_batch(uncond, cond);
         } else {
             context = std::move(cond);
         }
@@ -145,6 +166,8 @@ int main(int argc, char** argv) try {
     std::unique_ptr<Scheduler> sched = make_scheduler(opt.sampler);
     sched->set_timesteps(opt.steps);
     const int64_t lh = opt.height / 8, lw = opt.width / 8;
+    // 4 latent channels at 1/8 resolution. std::mt19937_64 + normal_distribution
+    // are deterministic per seed but differ from PyTorch's generator.
     Tensor x({1, 4, lh, lw});
     {
         std::mt19937_64 rng(opt.seed);
@@ -166,6 +189,9 @@ int main(int argc, char** argv) try {
             Tensor xin = x;
             sched->scale_model_input(xin, i);
             Tensor eps;
+            // Classifier-free guidance:
+            //     eps = eps_uncond + cfg * (eps_cond - eps_uncond)
+            // Both predictions come from one batched UNet call.
             if (use_cfg) {
                 Tensor both = unet.forward(repeat_batch(xin, 2), ts[i], context);
                 eps = slice_batch(both, 0);  // unconditional
@@ -188,6 +214,7 @@ int main(int argc, char** argv) try {
         VAEDecoder vae(w);
         Tensor img = vae.decode(x);  // [1,3,H,W] in [-1,1]
         const int H = (int)img.dim(2), W = (int)img.dim(3);
+        // [-1, 1] -> [0, 255], clamp, and interleave planar CHW into RGB.
         std::vector<uint8_t> rgb((size_t)H * W * 3);
         for (int c = 0; c < 3; ++c)
             for (int i = 0; i < H * W; ++i) {

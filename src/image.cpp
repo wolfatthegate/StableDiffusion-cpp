@@ -1,3 +1,14 @@
+// ============================================================================
+// image.cpp - Dependency-free PNG writer.
+//
+// A PNG is an 8-byte signature followed by chunks (length, 4-char type,
+// payload, CRC-32 of type + payload). We emit three:
+//   IHDR  width, height, bit depth 8, colour type 2 (RGB), no interlace
+//   IDAT  a zlib stream of the scanlines, each prefixed with filter byte 0
+//   IEND  empty terminator
+// The zlib stream uses deflate "stored" blocks (raw bytes, at most 65535
+// per block) followed by an Adler-32 checksum, so no compressor is needed.
+// ============================================================================
 #include "image.h"
 
 #include <fstream>
@@ -7,6 +18,8 @@ namespace sd {
 
 namespace {
 
+// Table-driven CRC-32 (polynomial 0xEDB88320), as required by PNG chunks.
+// The caller XORs the result with 0xFFFFFFFF to finalise.
 uint32_t crc32(const uint8_t* data, size_t n, uint32_t crc = 0xFFFFFFFFu) {
     static uint32_t table[256];
     static bool init = false;
@@ -22,6 +35,7 @@ uint32_t crc32(const uint8_t* data, size_t n, uint32_t crc = 0xFFFFFFFFu) {
     return crc;
 }
 
+// Appends a big-endian 32-bit integer (PNG byte order).
 void put32(std::vector<uint8_t>& v, uint32_t x) {
     v.push_back((uint8_t)(x >> 24));
     v.push_back((uint8_t)(x >> 16));
@@ -29,6 +43,7 @@ void put32(std::vector<uint8_t>& v, uint32_t x) {
     v.push_back((uint8_t)x);
 }
 
+// Appends one complete chunk: length, type, payload, CRC.
 void chunk(std::vector<uint8_t>& out, const char* type, const std::vector<uint8_t>& payload) {
     put32(out, (uint32_t)payload.size());
     std::vector<uint8_t> body(type, type + 4);
@@ -50,7 +65,9 @@ void write_png(const std::string& path, int width, int height, const std::vector
         raw.insert(raw.end(), rgb.begin() + (size_t)y * width * 3, rgb.begin() + (size_t)(y + 1) * width * 3);
     }
 
-    // zlib stream made of stored deflate blocks.
+    // zlib stream: header 0x78 0x01 (deflate, 32K window, no preset
+    // dictionary), then stored blocks. Each block header is 1 byte (BFINAL
+    // bit, BTYPE = 00) followed by LEN and its one's complement NLEN.
     std::vector<uint8_t> z = {0x78, 0x01};
     size_t pos = 0;
     while (pos < raw.size() || raw.empty()) {
@@ -65,6 +82,7 @@ void write_png(const std::string& path, int width, int height, const std::vector
         pos += len;
         if (raw.empty()) break;
     }
+    // Adler-32 of the uncompressed data closes the zlib stream.
     uint32_t a = 1, b = 0;
     for (uint8_t c : raw) {
         a = (a + c) % 65521;

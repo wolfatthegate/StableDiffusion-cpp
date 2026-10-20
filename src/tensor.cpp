@@ -1,3 +1,8 @@
+// ============================================================================
+// tensor.cpp - Thread pool, GEMM kernel, and the layer / elementwise ops
+// declared in tensor.h. See the header for the contract of each function;
+// comments here explain how they are implemented.
+// ============================================================================
 #include "tensor.h"
 
 #include <algorithm>
@@ -40,6 +45,13 @@ std::string Tensor::shape_str() const {
 
 // ============================================================================
 // Thread pool
+//
+// A fixed set of workers that sleep on a condition variable. Each run() call
+// publishes a job (function pointer + item count), bumps a generation
+// counter to wake the workers, and then every thread, including the caller,
+// pulls item indices from a shared atomic counter until they run out. The
+// caller waits for all workers to report back before returning, so fn and
+// anything it captures by reference stay valid for the whole job.
 // ============================================================================
 namespace {
 
@@ -59,8 +71,10 @@ public:
     }
     int size() const { return nthreads_; }
 
+    // Runs fn(0..n-1) across the pool and blocks until every call finished.
     void run(int64_t n, const std::function<void(int64_t)>& fn) {
         if (n <= 0) return;
+        // Not worth waking anyone for a single item or a one-thread pool.
         if (n == 1 || workers_.empty()) {
             for (int64_t i = 0; i < n; ++i) fn(i);
             return;
@@ -81,10 +95,13 @@ public:
     }
 
 private:
+    // Grabs and runs items until the shared counter passes n_.
     void work() {
         int64_t i;
         while ((i = next_.fetch_add(1, std::memory_order_relaxed)) < n_) (*fn_)(i);
     }
+    // Worker loop: sleep until a new generation (job) or shutdown, help with
+    // the job, then decrement `remaining_` and notify the caller if last.
     void worker() {
         uint64_t seen = 0;
         for (;;) {
@@ -99,20 +116,21 @@ private:
         }
     }
 
-    int nthreads_;
+    int nthreads_;                     // workers_ + the calling thread
     std::vector<std::thread> workers_;
     std::mutex m_;
     std::condition_variable cv_, done_cv_;
-    const std::function<void(int64_t)>* fn_ = nullptr;
-    int64_t n_ = 0;
-    std::atomic<int64_t> next_{0};
-    int remaining_ = 0;
-    uint64_t gen_ = 0;
-    bool stop_ = false;
+    const std::function<void(int64_t)>* fn_ = nullptr;  // current job
+    int64_t n_ = 0;                                     // its item count
+    std::atomic<int64_t> next_{0};                      // next item to hand out
+    int remaining_ = 0;  // workers that have not finished the current job
+    uint64_t gen_ = 0;   // incremented once per job to wake the workers
+    bool stop_ = false;  // set by the destructor
 };
 
+// The single global pool, created lazily on first use.
 std::unique_ptr<ThreadPool> g_pool;
-int g_requested_threads = 0;
+int g_requested_threads = 0;  // 0 = hardware_concurrency()
 
 ThreadPool& pool() {
     if (!g_pool) {
@@ -133,6 +151,8 @@ void parallel_for(int64_t n, const std::function<void(int64_t)>& fn) { pool().ru
 
 void parallel_chunks(int64_t n, int64_t min_chunk, const std::function<void(int64_t, int64_t)>& fn) {
     if (n <= 0) return;
+    // Up to 4 chunks per thread gives some load balancing without making
+    // chunks smaller than min_chunk.
     int64_t chunks = std::min<int64_t>(num_threads() * 4, std::max<int64_t>(1, n / std::max<int64_t>(1, min_chunk)));
     int64_t chunk = (n + chunks - 1) / chunks;
     parallel_for(chunks, [&](int64_t t) {
@@ -143,13 +163,28 @@ void parallel_chunks(int64_t n, int64_t min_chunk, const std::function<void(int6
 
 // ============================================================================
 // GEMM: C = A * B^T, with both operands K-contiguous.
-// 4x4 register tile; each of the 16 accumulators is a 4-lane vector that is
-// horizontally summed at the end (portable to NEON / SSE via vector extensions).
+//
+// Structure (no packing, which keeps the code short):
+//   * The output is cut into 64 x 128 tiles, one parallel_for item each, so
+//     threads never write to the same part of C.
+//   * Inside a tile, K is walked in 128-wide slices so the A and B rows
+//     being reused stay in L1/L2 cache.
+//   * The innermost micro-kernel computes a 4x4 block of C. Because both
+//     operands are contiguous along K, each of the 16 outputs is a dot
+//     product; it keeps 16 accumulators that are 4-lane vectors, loading
+//     4 rows of A and 4 rows of B per iteration (8 loads for 16 FMAs).
+//     The lanes are summed horizontally at the end.
+//   * Edge tiles (fewer than 4 rows or columns left) fall back to dot().
+// The vector type uses Clang/GCC vector extensions, which compile to NEON on
+// ARM and SSE/AVX on x86 without intrinsics.
 // ============================================================================
 namespace {
 
+// 4 floats in one SIMD register. aligned(4) allows unaligned loads.
 typedef float v4f __attribute__((vector_size(16), aligned(4)));
 
+// Unaligned load of 4 consecutive floats (memcpy is the portable idiom and
+// compiles to a single vector load).
 inline v4f ld4(const float* p) {
     v4f v;
     std::memcpy(&v, p, sizeof(v));
@@ -157,6 +192,7 @@ inline v4f ld4(const float* p) {
 }
 inline float hsum(v4f v) { return (v[0] + v[1]) + (v[2] + v[3]); }
 
+// Dot product of two length-K vectors, two vector accumulators wide.
 inline float dot(const float* a, const float* b, int64_t K) {
     v4f acc0 = {0, 0, 0, 0}, acc1 = {0, 0, 0, 0};
     int64_t k = 0;
@@ -169,6 +205,7 @@ inline float dot(const float* a, const float* b, int64_t K) {
     return s;
 }
 
+// C[0..3][0..3] += A[0..3][0..K) . B[0..3][0..K)  (adds to C, does not overwrite)
 void micro_4x4(int64_t K, const float* A, int64_t lda, const float* B, int64_t ldb, float* C, int64_t ldc) {
     const float *a0 = A, *a1 = A + lda, *a2 = A + 2 * lda, *a3 = A + 3 * lda;
     const float *b0 = B, *b1 = B + ldb, *b2 = B + 2 * ldb, *b3 = B + 3 * ldb;
@@ -189,6 +226,7 @@ void micro_4x4(int64_t K, const float* A, int64_t lda, const float* B, int64_t l
                      {hsum(c10), hsum(c11), hsum(c12), hsum(c13)},
                      {hsum(c20), hsum(c21), hsum(c22), hsum(c23)},
                      {hsum(c30), hsum(c31), hsum(c32), hsum(c33)}};
+    // Scalar tail when K is not a multiple of 4.
     for (; k < K; ++k) {
         float x0 = a0[k], x1 = a1[k], x2 = a2[k], x3 = a3[k];
         float y0 = b0[k], y1 = b1[k], y2 = b2[k], y3 = b3[k];
@@ -201,6 +239,7 @@ void micro_4x4(int64_t K, const float* A, int64_t lda, const float* B, int64_t l
         for (int j = 0; j < 4; ++j) C[i * ldc + j] += s[i][j];
 }
 
+// Same as micro_4x4 for a partial mr x nr block at the tile edges.
 void micro_edge(int64_t mr, int64_t nr, int64_t K, const float* A, int64_t lda, const float* B, int64_t ldb,
                 float* C, int64_t ldc) {
     for (int64_t i = 0; i < mr; ++i)
@@ -213,6 +252,7 @@ void gemm_nt(int64_t M, int64_t N, int64_t K, const float* A, int64_t lda, const
              int64_t ldc, const float* bias, bool accumulate) {
     if (M <= 0 || N <= 0) return;
 #ifdef USE_ACCELERATE
+    // Apple BLAS path: seed C with the bias and let sgemm add the product.
     float beta = accumulate ? 1.0f : 0.0f;
     if (bias) {
         for (int64_t i = 0; i < M; ++i) {
@@ -228,11 +268,13 @@ void gemm_nt(int64_t M, int64_t N, int64_t K, const float* A, int64_t lda, const
                 beta, C, (int)ldc);
     return;
 #endif
-    const int64_t MB = 64, NB = 128, KB = 128;
+    const int64_t MB = 64, NB = 128, KB = 128;  // tile sizes: rows, cols, K slice
     const int64_t mblocks = (M + MB - 1) / MB, nblocks = (N + NB - 1) / NB;
     parallel_for(mblocks * nblocks, [&](int64_t t) {
         const int64_t m0 = (t / nblocks) * MB, m1 = std::min(M, m0 + MB);
         const int64_t n0 = (t % nblocks) * NB, n1 = std::min(N, n0 + NB);
+        // Initialise this tile of C: bias, zero, or (accumulate) keep it.
+        // The micro-kernels below always add, so this runs exactly once.
         for (int64_t i = m0; i < m1; ++i) {
             float* c = C + i * ldc;
             if (!accumulate) {
@@ -263,6 +305,8 @@ void gemm_nt(int64_t M, int64_t N, int64_t K, const float* A, int64_t lda, const
 // ============================================================================
 // Layers
 // ============================================================================
+
+// Flattens all leading dimensions into rows: y[rows, out] = x[rows, in] W^T + b.
 Tensor linear(const Tensor& x, const Tensor& W, const Tensor* b) {
     const int64_t in = x.dim(-1), out = W.dim(0);
     if (W.dim(1) != in) throw std::runtime_error("linear: input dim " + x.shape_str() + " vs weight " + W.shape_str());
@@ -274,8 +318,15 @@ Tensor linear(const Tensor& x, const Tensor& W, const Tensor* b) {
     return y;
 }
 
-// im2col in chunks of output pixels so the scratch buffer stays around 64 MB,
-// then out[Cout, pixels] = W[Cout, K] * cols[pixels, K]^T.
+// Convolution as matrix multiplication (im2col):
+//   * For each output pixel p, gather the Cin x kh x kw input patch it sees
+//     into one row cols[p, 0..K) (zero where the patch hangs over the
+//     padding). The ordering (ci, ky, kx) matches PyTorch's weight layout, so
+//     the weight tensor [Cout, Cin, kh, kw] is already a [Cout, K] matrix.
+//   * Then out[Cout, pixels] = W[Cout, K] * cols[pixels, K]^T, which writes
+//     directly into the NCHW output since a channel's pixels are contiguous.
+// Pixels are processed in chunks so the scratch buffer is at most 2^24
+// floats (64 MB); a full-image buffer would need over 2 GB in the VAE.
 Tensor conv2d(const Tensor& x, const Tensor& W, const Tensor* b, int stride, int pad) {
     const int64_t N = x.dim(0), Cin = x.dim(1), H = x.dim(2), Wd = x.dim(3);
     const int64_t Cout = W.dim(0), kh = W.dim(2), kw = W.dim(3);
@@ -296,6 +347,7 @@ Tensor conv2d(const Tensor& x, const Tensor& W, const Tensor* b, int stride, int
         const float* xin = x.ptr() + n * Cin * H * Wd;
         for (int64_t p0 = 0; p0 < HW; p0 += chunk) {
             const int64_t P = std::min(chunk, HW - p0);
+            // Build the im2col rows for pixels p0 .. p0+P-1 in parallel.
             parallel_chunks(P, 32, [&](int64_t pb, int64_t pe) {
                 for (int64_t p = pb; p < pe; ++p) {
                     const int64_t oy = (p0 + p) / Wo, ox = (p0 + p) % Wo;
@@ -318,6 +370,8 @@ Tensor conv2d(const Tensor& x, const Tensor& W, const Tensor* b, int stride, int
                     }
                 }
             });
+            // ldc = HW: row co of this product is channel co of the output,
+            // starting at pixel p0.
             gemm_nt(Cout, P, K, W.ptr(), K, cols.data(), K, out.ptr() + n * Cout * HW + p0, HW, nullptr,
                     /*accumulate=*/b != nullptr);
         }
@@ -325,6 +379,10 @@ Tensor conv2d(const Tensor& x, const Tensor& W, const Tensor* b, int stride, int
     return out;
 }
 
+// One parallel task per (sample, group). Statistics are accumulated in
+// double because a group can hold over a million values (128 channels / 32
+// groups x 512 x 512 in the VAE), and the normalisation and affine transform
+// are folded into a single multiply-add per element.
 Tensor group_norm(const Tensor& x, int groups, const Tensor& gamma, const Tensor& beta, float eps) {
     const int64_t N = x.dim(0), C = x.dim(1), HW = x.numel() / (N * C);
     if (C % groups != 0) throw std::runtime_error("group_norm: channels not divisible by groups");
@@ -355,6 +413,7 @@ Tensor group_norm(const Tensor& x, int groups, const Tensor& gamma, const Tensor
     return y;
 }
 
+// Two-pass (mean, then variance) per row, rows processed in parallel.
 Tensor layer_norm(const Tensor& x, const Tensor& gamma, const Tensor& beta, float eps) {
     const int64_t C = x.dim(-1), rows = x.numel() / C;
     Tensor y(x.shape);
@@ -377,6 +436,8 @@ Tensor layer_norm(const Tensor& x, const Tensor& gamma, const Tensor& beta, floa
     return y;
 }
 
+// Subtracting the row max before exp() prevents overflow; masked (causal)
+// entries are written as exact zeros so the following P V product ignores them.
 void softmax_rows_(float* x, int64_t rows, int64_t cols, float scale, bool causal) {
     parallel_chunks(rows, 4, [&](int64_t rb, int64_t re) {
         for (int64_t r = rb; r < re; ++r) {
@@ -396,6 +457,11 @@ void softmax_rows_(float* x, int64_t rows, int64_t cols, float scale, bool causa
     });
 }
 
+// Heads are processed one at a time, materialising the full Sq x Skv score
+// matrix (4096 x 4096 floats = 64 MB at the largest UNet resolution). Each
+// head is a strided sub-matrix of q/k/v (leading dimension `inner`), so no
+// head splitting copies are needed except transposing V for the second GEMM.
+// Parallelism comes from inside gemm_nt and softmax_rows_.
 Tensor attention(const Tensor& q, const Tensor& k, const Tensor& v, int heads, bool causal) {
     const int64_t N = q.dim(0), Sq = q.dim(1), inner = q.dim(2), Skv = k.dim(1);
     if (inner % heads != 0) throw std::runtime_error("attention: inner dim not divisible by heads");
@@ -411,9 +477,11 @@ Tensor attention(const Tensor& q, const Tensor& k, const Tensor& v, int heads, b
             const float* qh = q.ptr() + n * Sq * inner + h * d;
             const float* kh = k.ptr() + n * Skv * inner + h * d;
             const float* vh = v.ptr() + n * Skv * inner + h * d;
+            // scores = Q_h K_h^T, then softmax with the 1/sqrt(d) scale
             gemm_nt(Sq, Skv, d, qh, inner, kh, inner, scores.data(), Skv);
             softmax_rows_(scores.data(), Sq, Skv, scale, causal);
-            // v_h^T [d, Skv] so that P V is again an NT product
+            // out_h = P V_h. gemm_nt needs V_h transposed ([d, Skv]) so that
+            // the product is again "row times row".
             for (int64_t s = 0; s < Skv; ++s)
                 for (int64_t j = 0; j < d; ++j) vT[j * Skv + s] = vh[s * inner + j];
             gemm_nt(Sq, d, Skv, scores.data(), Skv, vT.data(), Skv, out.ptr() + n * Sq * inner + h * d, inner);
@@ -422,6 +490,7 @@ Tensor attention(const Tensor& q, const Tensor& k, const Tensor& v, int heads, b
     return out;
 }
 
+// First half of each row is the value, second half the gate.
 Tensor geglu(const Tensor& x) {
     const int64_t D2 = x.dim(-1), D = D2 / 2, rows = x.numel() / D2;
     std::vector<int64_t> oshape = x.shape;
@@ -443,6 +512,9 @@ Tensor geglu(const Tensor& x) {
 
 // ============================================================================
 // Elementwise / shape
+//
+// Simple loops, parallelised in large chunks. The layout conversions are
+// transposes and are parallelised per (sample, channel).
 // ============================================================================
 void silu_(Tensor& x) {
     float* p = x.ptr();
