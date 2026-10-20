@@ -1,4 +1,10 @@
-// Checks the hand-written kernels against naive reference implementations.
+// ============================================================================
+// test_ops.cpp - Checks the hand-written kernels against naive reference
+// implementations (computed in double) on random inputs, then benchmarks one
+// representative GEMM. Odd sizes and padded leading dimensions are used on
+// purpose to exercise the edge-tile and stride code paths.
+// Exit status is non-zero if any check fails. Run with `make test`.
+// ============================================================================
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -10,6 +16,7 @@ using namespace sd;
 
 static int failures = 0;
 
+// Prints one result line and counts failures.
 static void check(const char* name, double max_err, double tol) {
     bool ok = max_err <= tol;
     std::printf("%-28s max|err| = %.3e  %s\n", name, max_err, ok ? "ok" : "FAIL");
@@ -21,6 +28,8 @@ static void fill(std::vector<float>& v, std::mt19937& rng) {
     for (float& x : v) x = n(rng);
 }
 
+// gemm_nt with leading dimensions larger than the logical sizes, optional
+// bias and accumulate, against a triple loop.
 static void test_gemm(std::mt19937& rng, int M, int N, int K, bool bias, bool acc) {
     std::vector<float> A((size_t)M * (K + 3)), B((size_t)N * (K + 5)), C((size_t)M * (N + 2)), ref, bv(N);
     fill(A, rng); fill(B, rng); fill(C, rng); fill(bv, rng);
@@ -42,6 +51,7 @@ static void test_gemm(std::mt19937& rng, int M, int N, int K, bool bias, bool ac
     check(name, err, 1e-3 * std::sqrt((double)K));
 }
 
+// conv2d against a direct 7-nested-loop convolution with zero padding.
 static void test_conv(std::mt19937& rng, int N, int Cin, int Cout, int H, int W, int k, int stride) {
     Tensor x({N, Cin, H, W}), w({Cout, Cin, k, k}), b({Cout});
     fill(x.data, rng); fill(w.data, rng); fill(b.data, rng);
@@ -69,6 +79,7 @@ static void test_conv(std::mt19937& rng, int N, int Cin, int Cout, int H, int W,
     check(name, err, 1e-3 * std::sqrt((double)Cin * k * k));
 }
 
+// attention against a per-head scalar softmax(QK^T/sqrt(d))V.
 static void test_attention(std::mt19937& rng, int N, int Sq, int Skv, int heads, int d, bool causal) {
     Tensor q({N, Sq, heads * d}), k({N, Skv, heads * d}), v({N, Skv, heads * d});
     fill(q.data, rng); fill(k.data, rng); fill(v.data, rng);
@@ -101,6 +112,8 @@ static void test_attention(std::mt19937& rng, int N, int Sq, int Skv, int heads,
     check(name, err, 1e-4);
 }
 
+// group_norm and layer_norm with identity affine: outputs must have mean 0
+// and variance 1 per normalisation group.
 static void test_norms(std::mt19937& rng) {
     Tensor x({2, 64, 5, 7}), g({64}), b({64});
     fill(x.data, rng);
@@ -137,6 +150,7 @@ static void test_norms(std::mt19937& rng) {
     check("layer_norm (mean0/var1)", err, 1e-3);
 }
 
+// Times a GEMM shaped like a 3x3 conv on 64x64 latents with 320 channels.
 static void bench_gemm() {
     const int M = 4096, N = 320, K = 2880;  // a typical UNet conv GEMM at 64x64 latents
     std::vector<float> A((size_t)M * K, 0.5f), B((size_t)N * K, 0.25f), C((size_t)M * N);

@@ -1,3 +1,6 @@
+// ============================================================================
+// tokenizer.cpp - CLIP byte-level BPE. See tokenizer.h for the algorithm.
+// ============================================================================
 #include "tokenizer.h"
 
 #include <climits>
@@ -11,6 +14,7 @@ namespace sd {
 
 namespace {
 
+// Reads a whole file into a string.
 std::string read_file(const std::string& path) {
     std::ifstream in(path, std::ios::binary);
     if (!in) throw std::runtime_error("cannot open " + path);
@@ -19,6 +23,7 @@ std::string read_file(const std::string& path) {
     return ss.str();
 }
 
+// Appends code point cp (< 0x10000) to out as UTF-8.
 void put_utf8(std::string& out, uint32_t cp) {
     if (cp < 0x80) {
         out += (char)cp;
@@ -46,6 +51,8 @@ uint32_t next_cp(const std::string& s, size_t& i) {
     return cp;
 }
 
+// Character classes approximating the whitespace, number and letter classes
+// used by CLIP's regex.
 bool is_space(uint32_t cp) { return cp == ' ' || cp == '\t' || cp == '\n' || cp == '\r' || cp == '\f' || cp == '\v' || cp == 0xA0; }
 bool is_digit(uint32_t cp) { return cp >= '0' && cp <= '9'; }
 // Approximation of \p{L}: ASCII letters plus every non-ASCII code point.
@@ -54,7 +61,10 @@ bool is_letter(uint32_t cp) { return (cp >= 'a' && cp <= 'z') || (cp >= 'A' && c
 }  // namespace
 
 CLIPTokenizer::CLIPTokenizer(const std::string& vocab_path, const std::string& merges_path) {
-    // bytes_to_unicode(): printable ranges map to themselves, the rest to 256+n.
+    // bytes_to_unicode() from GPT-2 / CLIP: bytes that are printable Latin-1
+    // characters map to the same code point; the remaining 68 bytes (control
+    // characters, space, etc.) map to U+0100, U+0101, ... in order. This gives
+    // every byte a visible, non-whitespace symbol that vocab.json can contain.
     std::vector<int> bs;
     for (int b = 33; b <= 126; ++b) bs.push_back(b);
     for (int b = 161; b <= 172; ++b) bs.push_back(b);
@@ -67,11 +77,14 @@ CLIPTokenizer::CLIPTokenizer(const std::string& vocab_path, const std::string& m
         put_utf8(byte_enc_[b], cp);
     }
 
+    // vocab.json: {"symbol": id, ...}, 49408 entries.
     Json vocab = parse_json(read_file(vocab_path));
     if (vocab.type != Json::Object) throw std::runtime_error("vocab.json: expected an object");
     encoder_.reserve(vocab.obj.size() * 2);
     for (const auto& kv : vocab.obj) encoder_[kv.first] = (int32_t)kv.second.num;
 
+    // merges.txt: one "first second" pair per line, in priority order; the
+    // line number (after the header) is the merge rank.
     std::istringstream merges(read_file(merges_path));
     std::string line;
     int32_t rank = 0;
@@ -92,6 +105,10 @@ CLIPTokenizer::CLIPTokenizer(const std::string& vocab_path, const std::string& m
     if (it != encoder_.end()) eos_ = it->second;
 }
 
+// Splits text into pieces, scanning code point by code point. At each
+// position the first matching alternative wins, in this order: special token,
+// contraction suffix, letter run, single digit, run of other non-space
+// characters. Whitespace separates pieces and is dropped.
 // Mirrors CLIP's regex:  <|startoftext|>|<|endoftext|>|'s|'t|'re|'ve|'m|'ll|'d|[\p{L}]+|[\p{N}]|[^\s\p{L}\p{N}]+
 std::vector<std::string> CLIPTokenizer::pretokenize(const std::string& text) {
     static const char* specials[] = {"<|startoftext|>", "<|endoftext|>"};
@@ -155,6 +172,9 @@ std::vector<std::string> CLIPTokenizer::pretokenize(const std::string& text) {
     return out;
 }
 
+// Classic greedy BPE: find the adjacent pair with the lowest merge rank,
+// merge every occurrence of it, repeat until no adjacent pair is in the
+// merge table. Quadratic in word length, which is fine for words.
 std::vector<std::string> CLIPTokenizer::bpe(std::vector<std::string> word) const {
     while (word.size() > 1) {
         int32_t best = INT_MAX;
@@ -184,6 +204,9 @@ std::vector<std::string> CLIPTokenizer::bpe(std::vector<std::string> word) const
     return word;
 }
 
+// Lower-cases, pre-tokenises, converts each piece to byte symbols with an
+// end-of-word marker, runs BPE, and maps symbols to ids. Symbols missing from
+// the vocabulary (should not happen with the real vocab) become EOS.
 std::vector<int32_t> CLIPTokenizer::tokenize(const std::string& text_in) const {
     std::string text = text_in;
     for (char& c : text)

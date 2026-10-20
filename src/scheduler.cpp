@@ -1,3 +1,7 @@
+// ============================================================================
+// scheduler.cpp - Beta schedule, Euler and DDIM samplers. See scheduler.h for
+// the maths and the calling convention.
+// ============================================================================
 #include "scheduler.h"
 
 #include <cmath>
@@ -5,6 +9,8 @@
 
 namespace sd {
 
+// "scaled_linear": betas are linear in sqrt-space, then squared. The
+// cumulative product is accumulated in double to avoid drift over 1000 terms.
 Scheduler::Scheduler() {
     const int T = 1000;
     const float b0 = std::sqrt(0.00085f), b1 = std::sqrt(0.012f);
@@ -22,11 +28,15 @@ Scheduler::Scheduler() {
 void EulerScheduler::set_timesteps(int steps) {
     if (steps < 1) throw std::runtime_error("steps must be >= 1");
     const int T = (int)alphas_cumprod_.size();
+    // sigma_t for every training timestep; increases from ~0.03 to ~14.6.
     std::vector<float> all_sigmas(T);
     for (int i = 0; i < T; ++i) all_sigmas[i] = std::sqrt((1.0f - alphas_cumprod_[i]) / alphas_cumprod_[i]);
 
     timesteps_.resize(steps);
     sigmas_.resize(steps + 1);
+    // "linspace": t_i evenly spaced from T-1 down to 0. Fractional timesteps
+    // get a sigma linearly interpolated between neighbouring integers; the
+    // UNet receives the fractional t as is.
     for (int i = 0; i < steps; ++i) {
         const float t = steps == 1 ? (float)(T - 1) : (float)(T - 1) * (float)(steps - 1 - i) / (float)(steps - 1);
         timesteps_[i] = t;
@@ -35,9 +45,11 @@ void EulerScheduler::set_timesteps(int steps) {
         const float frac = t - (float)lo;
         sigmas_[i] = all_sigmas[lo] + (all_sigmas[hi] - all_sigmas[lo]) * frac;
     }
-    sigmas_[steps] = 0.0f;
+    sigmas_[steps] = 0.0f;  // final target: a clean sample
 }
 
+// x has standard deviation sqrt(1 + sigma^2); dividing by it recovers the
+// x_t = sqrt(alpha_bar) x0 + sqrt(1 - alpha_bar) eps the UNet was trained on.
 void EulerScheduler::scale_model_input(Tensor& x, int step) const {
     const float s = sigmas_[step];
     scale_(x, 1.0f / std::sqrt(s * s + 1.0f));
@@ -56,6 +68,7 @@ void DDIMScheduler::set_timesteps(int steps) {
     if (steps < 1) throw std::runtime_error("steps must be >= 1");
     const int T = (int)alphas_cumprod_.size();
     step_ratio_ = T / steps;
+    // "leading" spacing with steps_offset = 1: 1, 1 + r, 1 + 2r, ... reversed.
     timesteps_.resize(steps);
     for (int i = 0; i < steps; ++i) timesteps_[i] = (float)((steps - 1 - i) * step_ratio_ + 1);
 }
@@ -64,11 +77,15 @@ void DDIMScheduler::step(const Tensor& eps, int step, Tensor& x) const {
     const int t = (int)timesteps_[step];
     const int prev_t = t - step_ratio_;
     const float a_t = alphas_cumprod_[t];
+    // After the last step prev_t is negative; diffusers' default
+    // (set_alpha_to_one = False) then uses alpha_bar_0.
     const float a_prev = prev_t >= 0 ? alphas_cumprod_[prev_t] : alphas_cumprod_[0];
     const float sqrt_at = std::sqrt(a_t), sqrt_1m_at = std::sqrt(1.0f - a_t);
     const float sqrt_ap = std::sqrt(a_prev), sqrt_1m_ap = std::sqrt(1.0f - a_prev);
     float* p = x.ptr();
     const float* e = eps.ptr();
+    // Predict x0 from the noise estimate, then re-noise it to level a_prev
+    // using the same eps (deterministic, eta = 0).
     for (int64_t i = 0; i < x.numel(); ++i) {
         const float x0 = (p[i] - sqrt_1m_at * e[i]) / sqrt_at;
         p[i] = sqrt_ap * x0 + sqrt_1m_ap * e[i];

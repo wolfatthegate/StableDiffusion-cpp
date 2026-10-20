@@ -1,3 +1,7 @@
+// ============================================================================
+// modules.cpp - Weight binding and forward passes for the building blocks in
+// modules.h. Each forward() follows the diffusers implementation line by line.
+// ============================================================================
 #include "modules.h"
 
 #include <stdexcept>
@@ -30,6 +34,8 @@ Tensor ResnetBlock::forward(const Tensor& x, const Tensor* temb) const {
     Tensor h = norm1(x);
     silu_(h);
     h = conv1(h);
+    // Time conditioning: project the embedding to C channels and add the
+    // same value to every pixel of that channel.
     if (temb_proj.valid() && temb) {
         Tensor t = temb_proj(*temb);  // [N, C]
         const int64_t N = h.dim(0), C = h.dim(1), HW = h.dim(2) * h.dim(3);
@@ -43,6 +49,7 @@ Tensor ResnetBlock::forward(const Tensor& x, const Tensor* temb) const {
     h = norm2(h);
     silu_(h);
     h = conv2(h);
+    // Residual connection; the 1x1 conv matches channel counts when needed.
     if (shortcut.valid()) {
         add_(h, shortcut(x));
     } else {
@@ -56,6 +63,8 @@ CrossAttention::CrossAttention(const Weights& w, const std::string& p, int heads
     : to_q(w, p + ".to_q"), to_k(w, p + ".to_k"), to_v(w, p + ".to_v"), to_out(w, p + ".to_out.0"), heads(heads_) {}
 
 Tensor CrossAttention::forward(const Tensor& x, const Tensor& context) const {
+    // Queries come from x; keys and values from the context. In SD 1.x the
+    // text context has 768 features, so to_k/to_v map 768 -> C.
     Tensor q = to_q(x), k = to_k(context), v = to_v(context);
     return to_out(attention(q, k, v, heads, false));
 }
@@ -70,17 +79,18 @@ BasicTransformerBlock::BasicTransformerBlock(const Weights& w, const std::string
 
 Tensor BasicTransformerBlock::forward(const Tensor& x_in, const Tensor& context) const {
     Tensor x = x_in;
-    {
+    {  // self-attention: the normalised tokens attend to themselves
         Tensor h = norm1(x);
         add_(x, attn1.forward(h, h));
     }
-    add_(x, attn2.forward(norm2(x), context));
+    add_(x, attn2.forward(norm2(x), context));  // cross-attention to the prompt
     add_(x, ff.forward(norm3(x)));
     return x;
 }
 
 // ---------------------------------------------------------------------------
 Transformer2D::Transformer2D(const Weights& w, const std::string& p, int heads) : norm(w, p + ".norm", 1e-6f) {
+    // A 2-D proj_in weight means Linear; 4-D ([C, C, 1, 1]) means 1x1 conv.
     linear_proj = w.get(p + ".proj_in.weight").ndim() == 2;
     if (linear_proj) {
         proj_in_lin = Linear(w, p + ".proj_in");
@@ -89,6 +99,7 @@ Transformer2D::Transformer2D(const Weights& w, const std::string& p, int heads) 
         proj_in_conv = Conv2d(w, p + ".proj_in");
         proj_out_conv = Conv2d(w, p + ".proj_out");
     }
+    // Bind transformer_blocks.0, .1, ... until one is missing.
     for (int i = 0; w.has(p + ".transformer_blocks." + std::to_string(i) + ".norm1.weight"); ++i)
         blocks.emplace_back(w, p + ".transformer_blocks." + std::to_string(i), heads);
 }
@@ -96,6 +107,8 @@ Transformer2D::Transformer2D(const Weights& w, const std::string& p, int heads) 
 Tensor Transformer2D::forward(const Tensor& x, const Tensor& context) const {
     const int64_t H = x.dim(2), W = x.dim(3);
     Tensor h = norm(x);
+    // A 1x1 conv on NCHW equals a Linear on [N, HW, C], so the only
+    // difference between the two variants is where the reshape happens.
     if (linear_proj) {
         h = proj_in_lin(nchw_to_nlc(h));
     } else {
@@ -107,7 +120,7 @@ Tensor Transformer2D::forward(const Tensor& x, const Tensor& context) const {
     } else {
         h = proj_out_conv(nlc_to_nchw(h, H, W));
     }
-    add_(h, x);
+    add_(h, x);  // residual around the whole transformer
     return h;
 }
 
@@ -128,6 +141,7 @@ VAEAttention::VAEAttention(const Weights& w, const std::string& p) : norm(w, p +
 
 Tensor VAEAttention::forward(const Tensor& x) const {
     const int64_t H = x.dim(2), W = x.dim(3);
+    // Each pixel is a token; with heads = 1 the full 512 channels form one head.
     Tensor h = nchw_to_nlc(norm(x));
     h = out(attention(q(h), k(h), v(h), 1, false));
     h = nlc_to_nchw(h, H, W);

@@ -1,3 +1,7 @@
+// ============================================================================
+// safetensors.cpp - mmap-based .safetensors reader with half-precision
+// conversion. See safetensors.h for the file format.
+// ============================================================================
 #include "safetensors.h"
 
 #include <fcntl.h>
@@ -15,6 +19,9 @@ namespace sd {
 
 namespace {
 
+// IEEE 754 half -> single precision, bit-exact, including subnormals,
+// infinities and NaN. Half: 1 sign, 5 exponent (bias 15), 10 mantissa bits.
+// Single: 1 sign, 8 exponent (bias 127), 23 mantissa bits.
 float f16_to_f32(uint16_t h) {
     uint32_t sign = (uint32_t)(h >> 15) << 31;
     uint32_t exp = (h >> 10) & 0x1F;
@@ -23,7 +30,7 @@ float f16_to_f32(uint16_t h) {
     if (exp == 0) {
         if (mant == 0) {
             bits = sign;
-        } else {  // subnormal: normalise
+        } else {  // subnormal: shift until the implicit leading 1 appears, adjusting the exponent
             uint32_t e = 113;
             while (!(mant & 0x400)) {
                 mant <<= 1;
@@ -32,9 +39,9 @@ float f16_to_f32(uint16_t h) {
             mant &= 0x3FF;
             bits = sign | (e << 23) | (mant << 13);
         }
-    } else if (exp == 31) {
+    } else if (exp == 31) {  // inf / NaN
         bits = sign | 0x7F800000u | (mant << 13);
-    } else {
+    } else {  // normal: rebias the exponent (127 - 15 = 112), widen the mantissa
         bits = sign | ((exp + 112) << 23) | (mant << 13);
     }
     float f;
@@ -42,6 +49,7 @@ float f16_to_f32(uint16_t h) {
     return f;
 }
 
+// bfloat16 is the top 16 bits of a float32, so conversion is a shift.
 float bf16_to_f32(uint16_t h) {
     uint32_t bits = (uint32_t)h << 16;
     float f;
@@ -49,6 +57,8 @@ float bf16_to_f32(uint16_t h) {
     return f;
 }
 
+// RAII read-only memory map of a whole file. The OS pages data in on
+// demand, so a 1.7 GB file costs no up-front read.
 struct MappedFile {
     void* base = nullptr;
     size_t size = 0;
@@ -73,6 +83,7 @@ struct MappedFile {
 }  // namespace
 
 void Weights::load_safetensors(const std::string& path) {
+    // 1. Map the file and parse the JSON header that follows the 8-byte length.
     MappedFile f(path);
     if (f.size < 8) throw std::runtime_error("safetensors: file too small: " + path);
     uint64_t hlen = 0;
@@ -83,11 +94,14 @@ void Weights::load_safetensors(const std::string& path) {
     const uint8_t* data = (const uint8_t*)f.base + 8 + hlen;
     const size_t data_size = f.size - 8 - (size_t)hlen;
 
+    // 2. Collect tensor names ("__metadata__" holds free-form strings).
     std::vector<std::string> names;
     for (const auto& kv : meta.obj)
         if (kv.first != "__metadata__") names.push_back(kv.first);
 
-    // Convert tensors in parallel; each one owns its destination slot already.
+    // 3. Validate each descriptor and allocate its destination serially (the
+    //    map must not be modified concurrently), remembering where its bytes
+    //    are. Unsupported dtypes leave slots[i] null.
     std::vector<Tensor*> slots(names.size());
     std::vector<std::string> dtypes(names.size());
     std::vector<std::pair<size_t, size_t>> ranges(names.size());
@@ -110,6 +124,7 @@ void Weights::load_safetensors(const std::string& path) {
         dtypes[i] = dtype;
         ranges[i] = {b, e};
     }
+    // 4. Convert all tensors in parallel; each task writes only its own slot.
     parallel_for((int64_t)names.size(), [&](int64_t i) {
         Tensor* t = slots[i];
         if (!t) return;
