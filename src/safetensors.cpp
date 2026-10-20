@@ -1,0 +1,151 @@
+#include "safetensors.h"
+
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
+#include <cstdio>
+#include <cstring>
+#include <stdexcept>
+
+#include "json.h"
+
+namespace sd {
+
+namespace {
+
+float f16_to_f32(uint16_t h) {
+    uint32_t sign = (uint32_t)(h >> 15) << 31;
+    uint32_t exp = (h >> 10) & 0x1F;
+    uint32_t mant = h & 0x3FF;
+    uint32_t bits;
+    if (exp == 0) {
+        if (mant == 0) {
+            bits = sign;
+        } else {  // subnormal: normalise
+            uint32_t e = 113;
+            while (!(mant & 0x400)) {
+                mant <<= 1;
+                --e;
+            }
+            mant &= 0x3FF;
+            bits = sign | (e << 23) | (mant << 13);
+        }
+    } else if (exp == 31) {
+        bits = sign | 0x7F800000u | (mant << 13);
+    } else {
+        bits = sign | ((exp + 112) << 23) | (mant << 13);
+    }
+    float f;
+    std::memcpy(&f, &bits, 4);
+    return f;
+}
+
+float bf16_to_f32(uint16_t h) {
+    uint32_t bits = (uint32_t)h << 16;
+    float f;
+    std::memcpy(&f, &bits, 4);
+    return f;
+}
+
+struct MappedFile {
+    void* base = nullptr;
+    size_t size = 0;
+    explicit MappedFile(const std::string& path) {
+        int fd = ::open(path.c_str(), O_RDONLY);
+        if (fd < 0) throw std::runtime_error("cannot open " + path);
+        struct stat st;
+        if (fstat(fd, &st) != 0) {
+            ::close(fd);
+            throw std::runtime_error("cannot stat " + path);
+        }
+        size = (size_t)st.st_size;
+        base = mmap(nullptr, size, PROT_READ, MAP_PRIVATE, fd, 0);
+        ::close(fd);
+        if (base == MAP_FAILED) throw std::runtime_error("mmap failed for " + path);
+    }
+    ~MappedFile() {
+        if (base) munmap(base, size);
+    }
+};
+
+}  // namespace
+
+void Weights::load_safetensors(const std::string& path) {
+    MappedFile f(path);
+    if (f.size < 8) throw std::runtime_error("safetensors: file too small: " + path);
+    uint64_t hlen = 0;
+    std::memcpy(&hlen, f.base, 8);
+    if (hlen + 8 > f.size) throw std::runtime_error("safetensors: bad header length in " + path);
+    std::string header((const char*)f.base + 8, (size_t)hlen);
+    Json meta = parse_json(header);
+    const uint8_t* data = (const uint8_t*)f.base + 8 + hlen;
+    const size_t data_size = f.size - 8 - (size_t)hlen;
+
+    std::vector<std::string> names;
+    for (const auto& kv : meta.obj)
+        if (kv.first != "__metadata__") names.push_back(kv.first);
+
+    // Convert tensors in parallel; each one owns its destination slot already.
+    std::vector<Tensor*> slots(names.size());
+    std::vector<std::string> dtypes(names.size());
+    std::vector<std::pair<size_t, size_t>> ranges(names.size());
+    for (size_t i = 0; i < names.size(); ++i) {
+        const Json& info = *meta.find(names[i]);
+        std::string dtype = info.at("dtype").str;
+        std::vector<int64_t> shape;
+        for (const Json& d : info.at("shape").arr) shape.push_back((int64_t)d.num);
+        const auto& off = info.at("data_offsets").arr;
+        size_t b = (size_t)off[0].num, e = (size_t)off[1].num;
+        if (e > data_size || b > e) throw std::runtime_error("safetensors: bad offsets for " + names[i]);
+        if (dtype != "F32" && dtype != "F16" && dtype != "BF16") {
+            std::fprintf(stderr, "  skipping %s (dtype %s)\n", names[i].c_str(), dtype.c_str());
+            continue;
+        }
+        Tensor& t = tensors[names[i]];
+        t.shape = shape;
+        t.data.resize((size_t)Tensor::numel_of(shape));
+        slots[i] = &t;
+        dtypes[i] = dtype;
+        ranges[i] = {b, e};
+    }
+    parallel_for((int64_t)names.size(), [&](int64_t i) {
+        Tensor* t = slots[i];
+        if (!t) return;
+        const uint8_t* src = data + ranges[i].first;
+        const size_t n = t->data.size();
+        const size_t bytes = ranges[i].second - ranges[i].first;
+        if (dtypes[i] == "F32") {
+            if (bytes != n * 4) throw std::runtime_error("safetensors: size mismatch for " + names[i]);
+            std::memcpy(t->data.data(), src, bytes);
+        } else {
+            if (bytes != n * 2) throw std::runtime_error("safetensors: size mismatch for " + names[i]);
+            const bool bf = dtypes[i] == "BF16";
+            for (size_t j = 0; j < n; ++j) {
+                uint16_t h;
+                std::memcpy(&h, src + 2 * j, 2);
+                t->data[j] = bf ? bf16_to_f32(h) : f16_to_f32(h);
+            }
+        }
+    });
+}
+
+const Tensor& Weights::get(const std::string& name) const {
+    auto it = tensors.find(name);
+    if (it == tensors.end()) throw std::runtime_error("missing weight: " + name);
+    return it->second;
+}
+
+const Tensor* Weights::try_get(const std::string& name) const {
+    auto it = tensors.find(name);
+    return it == tensors.end() ? nullptr : &it->second;
+}
+
+size_t Weights::total_params() const {
+    size_t n = 0;
+    for (const auto& kv : tensors) n += (size_t)kv.second.numel();
+    return n;
+}
+
+}  // namespace sd
