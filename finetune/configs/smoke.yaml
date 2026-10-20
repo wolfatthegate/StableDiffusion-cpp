@@ -1,0 +1,39 @@
+# Tiny end-to-end check: a few steps of LoRA on the synthetic shapes dataset
+# at low resolution, then an export that ./sd can load. Finishes in minutes
+# on an Apple Silicon Mac or any GPU; also runs on a CPU.
+model:
+  base: models/sd15
+
+data:
+  path: data/sample-shapes          # make with: python finetune/scripts/make_sample_dataset.py data/sample-shapes
+  resolution: 128
+  caption_dropout: 0.0
+  cache_latents: true
+
+weights:
+  method: lora
+  unet:
+    train: true
+  lora:
+    rank: 4
+    alpha: 4
+
+train:
+  steps: 6
+  batch_size: 2
+  lr: 1.0e-4
+  lr_scheduler: constant
+  precision: fp32
+  seed: 0
+
+checkpoint:
+  dir: runs/smoke
+  every: 3
+  keep: 2
+
+logging:
+  every: 1
+
+export:
+  output_dir: models/smoke-export
+  dtype: fp16

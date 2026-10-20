@@ -3,6 +3,7 @@
 // ============================================================================
 #include "json.h"
 
+#include <cstdio>
 #include <cstdlib>
 #include <stdexcept>
 
@@ -210,5 +211,28 @@ private:
 }  // namespace
 
 Json parse_json(const std::string& text) { return Parser(text).parse(); }
+
+std::string json_quote(const std::string& s) {
+    std::string out = "\"";
+    for (unsigned char c : s) {
+        switch (c) {
+            case '"': out += "\\\""; break;
+            case '\\': out += "\\\\"; break;
+            case '\n': out += "\\n"; break;
+            case '\r': out += "\\r"; break;
+            case '\t': out += "\\t"; break;
+            default:
+                if (c < 0x20) {
+                    char buf[8];
+                    std::snprintf(buf, sizeof buf, "\\u%04x", c);
+                    out += buf;
+                } else {
+                    out += (char)c;
+                }
+        }
+    }
+    out += "\"";
+    return out;
+}
 
 }  // namespace sd

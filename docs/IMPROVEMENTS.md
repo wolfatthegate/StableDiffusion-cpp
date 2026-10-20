@@ -50,8 +50,7 @@ decode time. A full 20-step run with Accelerate has not been timed end to end.
 | other measurements | value |
 |---|---|
 | built-in GEMM throughput, 4096x320x2880 | 550 to 600 GFLOP/s |
-| peak memory footprint | about 4.1 GB |
-| maximum resident set size, including the memory-mapped weight file | about 5.4 GB |
+| peak memory footprint, all three models resident | about 6.0 GB |
 
 ### Where the time goes in a denoising step
 
@@ -125,16 +124,33 @@ There are two separate levers, and they live in different places.
 | model weights | what the model draws: style, subjects, prompt following | in PyTorch, outside this repo. This repo only runs inference. |
 | inference code | speed, memory, sampler quality, prompt handling, features | in this repo |
 
-Fine-tuning changes the weights. This project cannot train, because it has
-no backward pass, no optimiser and no training data pipeline. Train in
-PyTorch with diffusers, export the result, and point `./sd` at it. As long as
-the architecture stays SD 1.x, no C++ changes are needed.
+Fine-tuning changes the weights. The C++ code cannot train, because it has
+no backward pass, no optimiser and no training data pipeline. The Python
+framework in [finetune/](../finetune/README.md) does the training with
+PyTorch and exports a directory that `./sd` loads. As long as the
+architecture stays SD 1.x, no C++ changes are needed.
 
 ## Using your own fine-tuned weights
 
-### Export from diffusers
+### With the bundled framework
 
-After training, save the pipeline in diffusers format with safetensors:
+```sh
+pip install -e finetune
+sdft inspect finetune/configs/lora.yaml      # which weights will train, and how many
+sdft train   finetune/configs/lora.yaml      # trains, then exports to models/sd15-lora
+./sd --model-dir models/sd15-lora --prompt "..."
+```
+
+The `weights` section of the YAML file selects the method (LoRA or full),
+the components, per-component learning rates, include/exclude patterns on
+layer names, and the LoRA rank and targets. The export merges adapters into
+the weights and writes `vocab.json` and `merges.txt`, which the C++ loader
+needs. See the framework README for the full option list.
+
+### Export from your own diffusers code
+
+If you train elsewhere, save the pipeline in diffusers format with
+safetensors:
 
 ```python
 pipe.save_pretrained("models/my-model", safe_serialization=True)
@@ -148,10 +164,12 @@ Then run:
 ./sd --model-dir models/my-model --prompt "..."
 ```
 
-The loader is `find_weights` in
-[src/main.cpp:118](../src/main.cpp#L118). It accepts `*.safetensors` and
-`*.fp16.safetensors` in the `text_encoder/`, `unet/` and `vae/` folders,
-plus `tokenizer/vocab.json` and `tokenizer/merges.txt`.
+The loader is `find_weights` in [src/pipeline.cpp](../src/pipeline.cpp).
+It accepts `*.safetensors` and `*.fp16.safetensors` in the `text_encoder/`,
+`unet/` and `vae/` folders, plus `tokenizer/vocab.json` and
+`tokenizer/merges.txt`. Recent `transformers` versions save the tokenizer as
+a single `tokenizer.json`; copy the two classic files from the base model if
+they are missing.
 
 ### What kinds of fine-tune work without code changes
 
@@ -160,7 +178,7 @@ plus `tokenizer/vocab.json` and `tokenizer/merges.txt`.
 | full UNet fine-tune | yes | |
 | full fine-tune including the text encoder | yes | |
 | DreamBooth | yes | if saved as a full pipeline |
-| LoRA, merged into the weights before export | yes | call `pipe.fuse_lora()` before `save_pretrained` |
+| LoRA, merged into the weights before export | yes | the bundled framework does this with `export.fuse_lora: true`; in your own code call `pipe.fuse_lora()` before `save_pretrained` |
 | LoRA as a separate file, loaded at run time | no | needs code; see below |
 | Textual inversion embeddings | no | needs code; see below |
 | a replacement VAE, such as `stabilityai/sd-vae-ft-mse` | yes | copy its files into `vae/` |
@@ -319,8 +337,8 @@ Ordered by expected improvement per unit of effort.
 
 - **Where:** `CLIPTokenizer::encode` at
   [src/tokenizer.h:34](../src/tokenizer.h#L34), which truncates to 77 tokens,
-  and the text-encoding block in `main` around
-  [src/main.cpp:158](../src/main.cpp#L158).
+  and the text-encoding line in `Pipeline::generate` at
+  [src/pipeline.cpp:73](../src/pipeline.cpp#L73).
 - **What:**
   - For long prompts, split the tokens into chunks of 75, encode each chunk
     with CLIP, and concatenate the results to `[1, 77*k, 768]`. The UNet's
@@ -338,7 +356,7 @@ Ordered by expected improvement per unit of effort.
 
 ### 5. Guidance refinements
 
-- **Where:** the guidance line at [src/main.cpp:200](../src/main.cpp#L200).
+- **Where:** the guidance line at [src/pipeline.cpp:96](../src/pipeline.cpp#L96).
 - **What:** guidance rescale, which reduces over-saturation at high `--cfg`,
   or a guidance scale that changes over the steps.
 

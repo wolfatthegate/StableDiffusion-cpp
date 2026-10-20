@@ -16,6 +16,12 @@ JSON libraries are all absent. Every piece of the pipeline is implemented in
 It runs on the CPU in float32 and reads the standard Hugging Face diffusers
 weight layout, so any SD 1.x checkpoint in that format works.
 
+Beside the command-line tool there is a **web interface** (`./sd-server`,
+also dependency-free) that shows the image emerging step by step while it is
+generated, and a **Python fine-tuning framework** (`finetune/`) whose YAML
+config decides which weights to train and that exports models the C++ code
+loads directly.
+
 | `--prompt "a photo of an astronaut riding a horse on mars, highly detailed"` <br> `--negative "blurry, low quality, deformed" --steps 20 --seed 42` | `--prompt "a watercolor painting of a lighthouse at sunset"` <br> `--sampler ddim --steps 15 --seed 7` |
 |---|---|
 | ![astronaut](examples/astronaut.png) | ![lighthouse](examples/lighthouse.png) |
@@ -26,15 +32,17 @@ weight layout, so any SD 1.x checkpoint in that format works.
 2. [Building](#building)
 3. [Model weights](#model-weights)
 4. [Command-line reference](#command-line-reference)
-5. [How Stable Diffusion works](#how-stable-diffusion-works)
-6. [Code tour](#code-tour)
-7. [Component reference](#component-reference)
-8. [Design decisions](#design-decisions)
-9. [Performance](#performance)
-10. [Testing](#testing)
-11. [Extending the code](#extending-the-code)
-12. [Limitations](#limitations)
-13. [Troubleshooting](#troubleshooting)
+5. [Web interface](#web-interface)
+6. [Fine-tuning](#fine-tuning)
+7. [How Stable Diffusion works](#how-stable-diffusion-works)
+8. [Code tour](#code-tour)
+9. [Component reference](#component-reference)
+10. [Design decisions](#design-decisions)
+11. [Performance](#performance)
+12. [Testing](#testing)
+13. [Extending the code](#extending-the-code)
+14. [Limitations](#limitations)
+15. [Troubleshooting](#troubleshooting)
 
 For profiling results, processor differences, using fine-tuned weights, and a
 map of where to change the code for speed or quality, see
@@ -43,9 +51,10 @@ map of where to change the code for speed or quality, see
 ## Quick start
 
 ```sh
-make -j                          # build ./sd
+make -j                          # build ./sd and ./sd-server
 scripts/download_sd15.sh         # fetch SD 1.5 weights (~2.1 GB) into models/sd15
 ./sd --prompt "a photo of a cat" --output cat.png
+./sd-server                      # then open http://127.0.0.1:8080/
 ```
 
 A 512x512 image with the default 20 steps takes about 95 seconds on a 10-core
@@ -64,7 +73,7 @@ Requirements:
 Targets:
 
 ```sh
-make                 # ./sd, the command-line tool
+make                 # ./sd (command line) and ./sd-server (web interface)
 make test            # build and run ./test_ops (kernel tests, no weights needed)
 make test_tokenizer  # build ./test_tokenizer (needs the tokenizer files)
 make clean           # remove build/ and all binaries
@@ -124,7 +133,7 @@ diffusers conversion script, because the tensor names differ.
 | `--cfg` | | 7.5 | classifier-free guidance scale; `1` disables guidance and halves the work |
 | `--width` | `-W` | 512 | image width; multiple of 8, at least 64 |
 | `--height` | `-H` | 512 | image height; multiple of 8, at least 64 |
-| `--seed` | `-s` | 42 | seed for the initial noise |
+| `--seed` | `-s` | 42 | seed for the initial noise; `-1` picks a random one and prints it |
 | `--sampler` | | `euler` | `euler` or `ddim` |
 | `--threads` | `-t` | all cores | worker threads |
 | `--output` | `-o` | `output.png` | output PNG path |
@@ -151,6 +160,76 @@ Practical notes:
 - Prompts longer than 75 tokens are truncated.
 - 20 to 30 Euler steps, or 15 to 50 DDIM steps, give good results. Guidance
   between 5 and 9 is typical.
+
+## Web interface
+
+```sh
+./sd-server [--model-dir models/sd15] [--host 127.0.0.1] [--port 8080] [--threads N] [--web-dir web]
+```
+
+Open the printed address in a browser. The page has the same controls as the
+command line.
+
+![web interface during generation](examples/web-ui.png)
+
+While an image is being generated it shows:
+
+- a **live preview** that sharpens step by step. Every step the server turns
+  the predicted clean latent into a small RGB image with a fixed 4-to-3 colour
+  map (no VAE pass), and the page shows it with a blur that shrinks as the
+  steps progress;
+- a progress ring with step count, the **time remaining** estimated from the
+  measured step times, elapsed time, seconds per step and the current
+  timestep;
+- a phase strip (queue, encode prompt, denoise, decode), a bar chart of
+  per-step times, and a cancel button that stops after the current step.
+
+Finished images appear in a strip with their settings; one click reloads
+them into the form. The seed used for a random-seed run is shown so an image
+can be reproduced. Form values persist in the browser. Reloading the page
+re-attaches to a generation already in progress.
+
+The server loads all three models once (about 6 GB of memory in use) and
+runs one generation at a time; further requests wait in a queue and the page shows
+the position. `--host 0.0.0.0` makes it reachable from other machines on
+the network. There is no authentication, so keep it on a trusted network.
+
+The server is written in the same dependency-free style: a small HTTP/1.1
+implementation on POSIX sockets in [src/http.cpp](src/http.cpp), the
+application in [src/server.cpp](src/server.cpp), and a single page in
+[web/index.html](web/index.html) with no frameworks. Progress is streamed
+with Server-Sent Events. The JSON API is documented at the top of
+`src/server.cpp` and can be used without the page:
+
+```sh
+curl -X POST localhost:8080/api/generate -H 'Content-Type: application/json' \
+     -d '{"prompt":"a red fox in snow","steps":20,"seed":-1}'        # -> {"id":"..."}
+curl -N localhost:8080/api/jobs/<id>/events                           # progress stream
+curl -o fox.png localhost:8080/api/jobs/<id>/image.png
+```
+
+## Fine-tuning
+
+The C++ code only runs models. To change what a model draws, train in
+PyTorch with the framework in [finetune/](finetune/README.md) and point
+`./sd` at the export:
+
+```sh
+pip install -e finetune
+python finetune/scripts/make_sample_dataset.py data/sample-shapes   # or use your own images + captions
+sdft inspect finetune/configs/lora.yaml                             # shows exactly which weights will train
+sdft train   finetune/configs/lora.yaml                             # LoRA on the UNet, exported to models/sd15-lora
+./sd --model-dir models/sd15-lora --prompt "..."
+```
+
+The YAML `weights` section chooses the method (LoRA adapters or full
+weights), which components train (UNet, text encoder), per-component
+learning rates, regular expressions that include or exclude layers by name,
+and the LoRA rank, scale and target layers. Training options include mixed
+precision, gradient checkpointing, min-SNR loss weighting, EMA, latent
+caching, checkpoints with resume and periodic sample images. Export merges
+adapters into the weights and writes a complete diffusers directory, so both
+this project and `diffusers` can load the result.
 
 ## How Stable Diffusion works
 
@@ -192,6 +271,9 @@ these levels.
 
 ```
 src/
+  pipeline.h / .cpp      Pipeline: models kept in memory, generate() with progress callback
+  http.h / .cpp          minimal HTTP/1.1 server with streamed responses
+  server.cpp             sd-server: JSON API, job queue, live previews
   tensor.h / .cpp        Tensor type, thread pool, GEMM, and every operator
   json.h / .cpp          minimal JSON parser
   safetensors.h / .cpp   weight file loader with F16/BF16 conversion
@@ -201,8 +283,13 @@ src/
   unet.h / .cpp          UNet2DConditionModel
   vae.h / .cpp           AutoencoderKL decoder
   scheduler.h / .cpp     beta schedule, Euler and DDIM samplers
-  image.h / .cpp         PNG writer
-  main.cpp               CLI and the generation pipeline
+  image.h / .cpp         PNG encoder and base64
+  main.cpp               CLI on top of Pipeline
+web/
+  index.html             the web interface, one file, no frameworks
+finetune/
+  sdft/                  Python fine-tuning framework (see finetune/README.md)
+  configs/               example configs: lora.yaml, full.yaml, smoke.yaml
 tests/
   test_ops.cpp           kernel tests against naive references, plus a GEMM benchmark
   test_tokenizer.cpp     tokenizer tests against known token ids
@@ -214,18 +301,17 @@ examples/                sample outputs shown above
 Dependencies flow strictly upwards:
 
 ```
-main.cpp
-  ├── clip, unet, vae ──> modules ──> safetensors ──> json
-  │                          └──────> tensor
-  ├── tokenizer ──> json
-  ├── scheduler ──> tensor
-  └── image
+main.cpp, server.cpp ──> pipeline ──┬── clip, unet, vae ──> modules ──> safetensors ──> json
+                        (server.cpp │                          └──────> tensor
+                         also http) ├── tokenizer ──> json
+                                    ├── scheduler ──> tensor
+                                    └── image
 ```
 
 Suggested reading order for a review:
 
 1. `src/tensor.h`, for the data model and operator contracts.
-2. `src/main.cpp`, for the end-to-end pipeline.
+2. `src/pipeline.cpp`, for the end-to-end pipeline.
 3. `src/modules.h` and `src/modules.cpp`, for the layers.
 4. `src/unet.h`, `src/clip.h` and `src/vae.h`, which describe each model's
    layout in their header comments.
@@ -316,8 +402,8 @@ Tensors of other dtypes are skipped with a message. The only such tensor in
 SD 1.5 is CLIP's integer `position_ids` buffer, which is not needed.
 
 `Weights` maps names to tensors. Model classes keep raw pointers into it, so
-it must outlive them. `main.cpp` loads each model's weights in its own scope
-and frees them before loading the next model.
+it must outlive them. `Pipeline` owns one `Weights` per model and keeps all
+three loaded for its lifetime.
 
 ### Tokenizer (`src/tokenizer.h`)
 
@@ -393,7 +479,7 @@ Only the decoder is implemented, because text-to-image never encodes an
 image. It applies `post_quant_conv` and `conv_in` to reach 512 channels, a
 mid block with single-head self-attention, then four up blocks of three
 resnets each, the first three of which upsample 2x. A final group norm, SiLU
-and conv produce RGB in roughly `[-1, 1]`. `main.cpp` maps this to
+and conv produce RGB in roughly `[-1, 1]`. `Pipeline::generate` maps this to
 `[0, 255]` with clamping.
 
 ### Samplers (`src/scheduler.h`)
@@ -421,9 +507,26 @@ x_prev = sqrt(a_prev) * x0 + sqrt(1 - a_prev) * eps
 
 ### PNG writer (`src/image.h`)
 
-`write_png` writes an 8-bit RGB PNG with three chunks: IHDR, IDAT and IEND.
-The pixel data uses deflate "stored" blocks, which are uncompressed, so no
-zlib is needed. A 512x512 image is about 790 KB.
+`encode_png` produces an 8-bit RGB PNG with three chunks: IHDR, IDAT and
+IEND; `write_png` saves it to a file. The pixel data uses deflate "stored"
+blocks, which are uncompressed, so no zlib is needed. A 512x512 image is
+about 790 KB. `base64_encode` lets the server embed the small per-step
+previews in its progress events.
+
+### Pipeline and server (`src/pipeline.h`, `src/http.h`, `src/server.cpp`)
+
+`Pipeline` loads the tokenizer and the three models once and exposes
+`generate(params, progress)`. The progress callback is called before text
+encoding, after every sampler step (with the step time and the predicted
+clean latent), and before decoding; returning `false` cancels after the
+current step. `latent_to_rgb` turns a latent into a rough RGB preview with
+fixed per-channel weights, without running the VAE.
+
+`http::Server` is a minimal HTTP/1.1 server: one thread per connection,
+exact or prefix routes, JSON and streamed responses, and request size limits.
+`server.cpp` builds the application on it: a FIFO job queue with one worker
+thread, Server-Sent Events that replay a job's history to late subscribers,
+cancellation, and an in-memory gallery of the last sixty results.
 
 ## Design decisions
 
@@ -436,8 +539,9 @@ zlib is needed. A 512x512 image is about 790 KB.
 - **Structure from weights.** Models discover their layout from tensor names
   instead of a config file, so there is no `config.json` parser and
   fine-tunes load unchanged.
-- **One model in memory at a time.** The text encoder, UNet and VAE are
-  loaded and freed in sequence, which keeps peak memory near the UNet's size.
+- **Models stay loaded.** `Pipeline` holds the text encoder, UNet and VAE
+  together (about 6 GB in use, float32) so the server can answer many
+  requests; the command-line tool pays the same cost for one image.
 - **Batched guidance.** The conditional and unconditional UNet passes run as
   one batch of two, so weights are read once per step.
 
@@ -454,9 +558,8 @@ built-in GEMM:
 | VAE decode and PNG write at 512x512 | 7.2 s |
 | full 20-step image | about 94 s |
 
-Peak memory footprint at 512x512 is about 4.1 GB, and the maximum resident
-set size reported by the OS is about 5.4 GB because the memory-mapped weight
-file is counted too.
+Peak memory footprint at 512x512 is about 6.0 GB with all three models
+loaded in float32.
 
 These numbers come from an Apple M1 Max and will differ on other processors.
 [docs/IMPROVEMENTS.md](docs/IMPROVEMENTS.md) has the full profile, an
@@ -476,6 +579,7 @@ Ways to make it faster, roughly in order of payoff:
 ```sh
 make test                 # kernel tests
 make test_tokenizer && ./test_tokenizer [model-dir]
+python finetune/tests/test_config.py && python finetune/tests/test_lora.py   # fine-tuning framework
 ```
 
 `test_ops` compares `gemm_nt`, `conv2d`, `attention`, `group_norm` and
@@ -487,8 +591,17 @@ needs no weights and exits non-zero on any failure.
 `test_tokenizer` checks case folding, contractions, digits, punctuation runs,
 empty input and the 77-token padding against ids from the real vocabulary.
 
-End-to-end correctness was checked by generating the example images above.
-The pipeline has not been compared tensor by tensor against PyTorch.
+The Python tests check the strict config loader (unknown keys, type errors,
+overrides, nested defaults) and the LoRA implementation (zero-initialised
+adapters leave outputs unchanged, merging reproduces the adapted outputs,
+save and load round-trip).
+
+End-to-end correctness was checked by generating the example images above,
+by exercising every server endpoint with `curl` and headless Chrome, and by
+training a LoRA with `finetune/configs/smoke.yaml`, exporting it, and
+generating from the export with `./sd`. An untrained model passed through
+the export produces pixel-identical output to the original weights. The
+pipeline has not been compared tensor by tensor against PyTorch.
 
 ## Extending the code
 
@@ -520,8 +633,11 @@ The pipeline has not been compared tensor by tensor against PyTorch.
 - SD 2.x and SDXL are not supported.
 - Random numbers come from `std::mt19937_64`, so a seed does not reproduce
   the image a PyTorch pipeline makes with the same seed.
-- Only text-to-image is implemented. There is no image-to-image, inpainting,
-  LoRA or ControlNet support.
+- Only text-to-image is implemented. There is no image-to-image, inpainting
+  or ControlNet support. LoRA adapters must be merged into the weights, which
+  the fine-tuning framework's export does.
+- The web server has no authentication or TLS; it is meant for localhost or a
+  trusted network.
 
 ## Troubleshooting
 
@@ -532,3 +648,9 @@ The pipeline has not been compared tensor by tensor against PyTorch.
 | `concat_channels: [...] vs [...]` | Width or height is not a multiple of 64. |
 | `cannot open .../vocab.json` | The tokenizer files are missing from the model directory. |
 | Very slow generation | Check that `threads:` on the first line matches your core count, and that no other heavy process is running. |
+| `cannot bind 127.0.0.1:8080` | Another process uses the port; pass `--port`. |
+| `web/index.html not found` in the browser | Start `sd-server` from the repository root or pass `--web-dir`. |
+| Page shows "server unreachable" | The server is still loading the weights, or it was started with a different `--port`. |
+| `sdft` fails with `is not a local folder and is not a valid model identifier` | `model.base` is relative; run from the repository root or use an absolute path. |
+| `sdft` export says `tokenizer/vocab.json MISSING` | The base directory lacks the tokenizer files; the export copies them from `model.base`, so check that directory. |
+| Trained model draws the same as the base | Too few steps or too low a learning rate; check `runs/<name>/log.jsonl` for a falling loss and the sample images. |

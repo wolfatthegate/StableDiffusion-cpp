@@ -36,4 +36,7 @@ struct Json {
 // offset of the problem on malformed input or trailing garbage.
 Json parse_json(const std::string& text);
 
+// Returns s as a quoted JSON string literal with all required escapes.
+std::string json_quote(const std::string& s);
+
 }  // namespace sd

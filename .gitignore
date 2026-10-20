@@ -1,8 +1,14 @@
 models/
 build/
 sd
+sd-server
 test_ops
 test_tokenizer
 *.png
 .DS_Store
 !examples/*.png
+finetune/.venv/
+finetune/**/__pycache__/
+runs/
+data/
+finetune/*.egg-info/

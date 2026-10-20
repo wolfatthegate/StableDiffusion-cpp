@@ -63,6 +63,16 @@ void EulerScheduler::step(const Tensor& eps, int step, Tensor& x) const {
     for (int64_t i = 0; i < x.numel(); ++i) p[i] += e[i] * dt;
 }
 
+// x = x0 + sigma * eps  =>  x0 = x - sigma * eps
+Tensor EulerScheduler::predict_x0(const Tensor& x, const Tensor& eps, int step) const {
+    const float sigma = sigmas_[step];
+    Tensor x0 = x;
+    float* p = x0.ptr();
+    const float* e = eps.ptr();
+    for (int64_t i = 0; i < x0.numel(); ++i) p[i] -= sigma * e[i];
+    return x0;
+}
+
 // ---------------------------------------------------------------------------
 void DDIMScheduler::set_timesteps(int steps) {
     if (steps < 1) throw std::runtime_error("steps must be >= 1");
@@ -90,6 +100,17 @@ void DDIMScheduler::step(const Tensor& eps, int step, Tensor& x) const {
         const float x0 = (p[i] - sqrt_1m_at * e[i]) / sqrt_at;
         p[i] = sqrt_ap * x0 + sqrt_1m_ap * e[i];
     }
+}
+
+Tensor DDIMScheduler::predict_x0(const Tensor& x, const Tensor& eps, int step) const {
+    const int t = (int)timesteps_[step];
+    const float a_t = alphas_cumprod_[t];
+    const float sqrt_at = std::sqrt(a_t), sqrt_1m_at = std::sqrt(1.0f - a_t);
+    Tensor x0 = x;
+    float* p = x0.ptr();
+    const float* e = eps.ptr();
+    for (int64_t i = 0; i < x0.numel(); ++i) p[i] = (p[i] - sqrt_1m_at * e[i]) / sqrt_at;
+    return x0;
 }
 
 std::unique_ptr<Scheduler> make_scheduler(const std::string& name) {

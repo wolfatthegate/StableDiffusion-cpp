@@ -1,0 +1,397 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>StableDiffusion-cpp</title>
+<style>
+  :root {
+    --bg: #0e1116; --panel: #161b22; --panel-2: #1c2330; --border: #2a3342;
+    --text: #e6edf3; --muted: #8b98a9; --accent: #6ea8fe; --accent-2: #b388ff;
+    --ok: #3fb950; --warn: #d29922; --err: #f85149;
+    --radius: 14px; --shadow: 0 10px 30px rgba(0,0,0,.35);
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; background: var(--bg); color: var(--text);
+    font: 14px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, Roboto, sans-serif; }
+  body { min-height: 100vh; display: flex; flex-direction: column; }
+  button, input, select, textarea { font: inherit; color: inherit; }
+
+  header { display: flex; align-items: center; gap: 14px; padding: 12px 20px; border-bottom: 1px solid var(--border);
+    background: linear-gradient(180deg, #131821, var(--bg)); }
+  header h1 { font-size: 16px; margin: 0; font-weight: 650; letter-spacing: .2px; }
+  header h1 span { color: var(--accent); }
+  #status { margin-left: auto; color: var(--muted); font-size: 12.5px; display: flex; gap: 14px; align-items: center; }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); display: inline-block; margin-right: 6px; }
+  .dot.ok { background: var(--ok); box-shadow: 0 0 8px var(--ok); }
+  .dot.busy { background: var(--warn); box-shadow: 0 0 8px var(--warn); animation: pulse 1.2s infinite; }
+
+  main { flex: 1; display: grid; grid-template-columns: 380px 1fr; gap: 18px; padding: 18px 20px; max-width: 1500px; width: 100%; margin: 0 auto; }
+  @media (max-width: 960px) { main { grid-template-columns: 1fr; } }
+
+  .panel { background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius); box-shadow: var(--shadow); }
+  form.panel { padding: 16px; display: flex; flex-direction: column; gap: 12px; align-self: start; position: sticky; top: 18px; }
+  label { display: flex; flex-direction: column; gap: 5px; font-size: 12.5px; color: var(--muted); }
+  label > span { display: flex; justify-content: space-between; }
+  label > span b { color: var(--text); font-weight: 500; }
+  textarea, input[type=text], input[type=number], select {
+    background: var(--panel-2); border: 1px solid var(--border); border-radius: 9px; padding: 9px 10px; outline: none;
+    transition: border-color .15s; }
+  textarea:focus, input:focus, select:focus { border-color: var(--accent); }
+  textarea { resize: vertical; min-height: 84px; }
+  .row { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+  .row3 { display: grid; grid-template-columns: 1fr 1fr auto; gap: 10px; align-items: end; }
+  input[type=range] { width: 100%; accent-color: var(--accent); }
+  .btn { border: 1px solid var(--border); background: var(--panel-2); border-radius: 9px; padding: 9px 12px; cursor: pointer;
+    transition: background .15s, transform .05s; white-space: nowrap; }
+  .btn:hover { background: #242d3c; } .btn:active { transform: translateY(1px); }
+  .btn.primary { background: linear-gradient(135deg, var(--accent), var(--accent-2)); border: none; color: #0b0f16; font-weight: 650; padding: 12px; font-size: 15px; }
+  .btn.primary:disabled { opacity: .55; cursor: not-allowed; }
+  .btn.danger { border-color: #5b2a2a; color: #ffb3ad; }
+  .hint { color: var(--muted); font-size: 12px; text-align: center; }
+
+  /* ---- stage ---- */
+  #stage-wrap { display: flex; flex-direction: column; gap: 14px; min-width: 0; }
+  #stage { position: relative; aspect-ratio: 1 / 1; max-height: 78vh; margin: 0 auto; width: 100%; max-width: 78vh;
+    border-radius: var(--radius); overflow: hidden; background: #0a0d12; border: 1px solid var(--border); box-shadow: var(--shadow); }
+  #stage.landscape { aspect-ratio: 3 / 2; max-width: none; }
+  #stage.portrait { aspect-ratio: 2 / 3; max-width: 52vh; }
+  #stage img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; }
+  #preview { filter: blur(14px) saturate(1.15); transform: scale(1.04); transition: filter .6s ease, opacity .6s ease; opacity: 0; }
+  #final { opacity: 0; transition: opacity .9s ease; }
+  #placeholder { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 10px;
+    color: var(--muted); text-align: center; padding: 20px; }
+  #placeholder svg { width: 54px; height: 54px; opacity: .5; }
+  .shimmer { position: absolute; inset: 0; background: linear-gradient(110deg, transparent 20%, rgba(255,255,255,.06) 50%, transparent 80%);
+    background-size: 200% 100%; animation: shimmer 1.6s linear infinite; opacity: 0; transition: opacity .4s; }
+  .shimmer.on { opacity: 1; }
+  @keyframes shimmer { from { background-position: 200% 0; } to { background-position: -200% 0; } }
+  @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: .35; } }
+
+  /* HUD overlay while generating */
+  #hud { position: absolute; left: 14px; right: 14px; bottom: 14px; display: flex; align-items: flex-end; gap: 12px;
+    opacity: 0; transition: opacity .35s; pointer-events: none; }
+  #hud.on { opacity: 1; pointer-events: auto; }
+  .card { background: rgba(14,17,22,.78); backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px);
+    border: 1px solid rgba(255,255,255,.08); border-radius: 12px; padding: 10px 12px; }
+  #ring-card { display: flex; align-items: center; gap: 12px; }
+  #ring { width: 64px; height: 64px; transform: rotate(-90deg); }
+  #ring .track { fill: none; stroke: rgba(255,255,255,.1); stroke-width: 6; }
+  #ring .bar { fill: none; stroke: url(#grad); stroke-width: 6; stroke-linecap: round; stroke-dasharray: 163.4; stroke-dashoffset: 163.4;
+    transition: stroke-dashoffset .5s ease; }
+  #ring-text { font-size: 12.5px; color: var(--muted); line-height: 1.5; }
+  #ring-text b { color: var(--text); font-size: 15px; font-weight: 650; }
+  #stats { margin-left: auto; display: grid; grid-template-columns: auto auto; gap: 2px 14px; font-size: 12px; color: var(--muted); }
+  #stats b { color: var(--text); font-weight: 600; font-variant-numeric: tabular-nums; }
+  #bars { position: absolute; left: 0; right: 0; bottom: 0; height: 26px; display: flex; align-items: flex-end; gap: 2px; padding: 0 2px;
+    opacity: 0; transition: opacity .3s; }
+  #bars.on { opacity: .7; }
+  #bars i { flex: 1; background: linear-gradient(180deg, var(--accent), var(--accent-2)); border-radius: 2px 2px 0 0; min-height: 2px; }
+
+  /* phase stepper */
+  #phases { position: absolute; top: 14px; left: 14px; display: flex; gap: 6px; opacity: 0; transition: opacity .35s; }
+  #phases.on { opacity: 1; }
+  .phase { font-size: 11.5px; padding: 5px 10px; border-radius: 999px; border: 1px solid rgba(255,255,255,.1);
+    background: rgba(14,17,22,.7); color: var(--muted); display: flex; align-items: center; gap: 6px; }
+  .phase .dot { margin: 0; }
+  .phase.active { color: var(--text); border-color: var(--accent); }
+  .phase.active .dot { background: var(--accent); box-shadow: 0 0 8px var(--accent); animation: pulse 1.2s infinite; }
+  .phase.done .dot { background: var(--ok); }
+  #cancel { position: absolute; top: 14px; right: 14px; opacity: 0; transition: opacity .35s; pointer-events: none; }
+  #cancel.on { opacity: 1; pointer-events: auto; }
+
+  /* result bar under the stage */
+  #result { display: none; align-items: center; gap: 10px; padding: 10px 14px; font-size: 12.5px; color: var(--muted); flex-wrap: wrap; }
+  #result.on { display: flex; }
+  #result b { color: var(--text); font-weight: 600; }
+  #result .grow { flex: 1; min-width: 160px; }
+  #error { display: none; padding: 12px 14px; border-radius: 10px; border: 1px solid #5b2a2a; background: #2a1414; color: #ffb3ad; }
+  #error.on { display: block; }
+
+  /* history */
+  #history { padding: 12px 14px; }
+  #history h2 { font-size: 12.5px; margin: 0 0 8px; color: var(--muted); font-weight: 500; text-transform: uppercase; letter-spacing: .5px; }
+  #thumbs { display: flex; gap: 8px; overflow-x: auto; padding-bottom: 4px; }
+  #thumbs:empty::after { content: "Finished images appear here."; color: var(--muted); font-size: 12.5px; }
+  .thumb { flex: 0 0 auto; width: 88px; height: 88px; border-radius: 9px; overflow: hidden; border: 2px solid transparent; cursor: pointer;
+    background: #0a0d12; transition: border-color .15s, transform .15s; }
+  .thumb:hover { transform: translateY(-2px); } .thumb.active { border-color: var(--accent); }
+  .thumb img { width: 100%; height: 100%; object-fit: cover; display: block; }
+  code { background: var(--panel-2); padding: 1px 5px; border-radius: 5px; font-size: 12px; }
+</style>
+</head>
+<body>
+<header>
+  <h1><span>SD</span>-cpp &middot; text to image</h1>
+  <div id="status"><span><i class="dot" id="status-dot"></i><span id="status-text">connecting&hellip;</span></span></div>
+</header>
+
+<main>
+  <form class="panel" id="form" autocomplete="off">
+    <label>Prompt
+      <textarea id="prompt" placeholder="a photo of an astronaut riding a horse on mars, highly detailed" required></textarea>
+    </label>
+    <label>Negative prompt
+      <textarea id="negative" style="min-height:52px" placeholder="blurry, low quality, deformed"></textarea>
+    </label>
+    <div class="row">
+      <label><span>Steps <b id="steps-v">20</b></span><input type="range" id="steps" min="1" max="60" value="20"></label>
+      <label><span>Guidance <b id="cfg-v">7.5</b></span><input type="range" id="cfg" min="1" max="15" step="0.5" value="7.5"></label>
+    </div>
+    <div class="row">
+      <label>Size
+        <select id="size">
+          <option value="512x512">512 &times; 512 (square)</option>
+          <option value="512x768">512 &times; 768 (portrait)</option>
+          <option value="768x512">768 &times; 512 (landscape)</option>
+          <option value="448x640">448 &times; 640</option>
+          <option value="640x448">640 &times; 448</option>
+          <option value="384x384">384 &times; 384 (fast)</option>
+          <option value="256x256">256 &times; 256 (test)</option>
+        </select>
+      </label>
+      <label>Sampler
+        <select id="sampler"><option value="euler">Euler</option><option value="ddim">DDIM</option></select>
+      </label>
+    </div>
+    <div class="row3">
+      <label>Seed <input type="number" id="seed" value="-1" step="1"></label>
+      <label>&nbsp;<button type="button" class="btn" id="dice" title="Random seed (-1)">&#127922; random</button></label>
+      <label>&nbsp;<button type="button" class="btn" id="lock" title="Keep the last seed">&#128274; last</button></label>
+    </div>
+    <button class="btn primary" id="go" type="submit">Generate</button>
+    <div class="hint">Cmd/Ctrl + Enter to generate &middot; sizes are multiples of 64</div>
+  </form>
+
+  <section id="stage-wrap">
+    <div id="stage">
+      <div id="placeholder">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="3" y="4" width="18" height="16" rx="3"/><circle cx="9" cy="10" r="2"/><path d="M21 16l-5-5-8 8"/></svg>
+        <div>Your image will appear here.</div>
+        <div style="font-size:12px">While it is being made you will see the picture emerge step by step.</div>
+      </div>
+      <div class="shimmer" id="shimmer"></div>
+      <img id="preview" alt="">
+      <img id="final" alt="">
+      <div id="bars"></div>
+      <div id="phases">
+        <span class="phase" data-phase="queued"><i class="dot"></i>Queue</span>
+        <span class="phase" data-phase="text"><i class="dot"></i>Encode prompt</span>
+        <span class="phase" data-phase="denoise"><i class="dot"></i>Denoise</span>
+        <span class="phase" data-phase="decode"><i class="dot"></i>Decode</span>
+      </div>
+      <button class="btn danger" id="cancel" type="button">Cancel</button>
+      <div id="hud">
+        <div class="card" id="ring-card">
+          <svg id="ring" viewBox="0 0 64 64">
+            <defs><linearGradient id="grad" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#6ea8fe"/><stop offset="1" stop-color="#b388ff"/></linearGradient></defs>
+            <circle class="track" cx="32" cy="32" r="26"/><circle class="bar" cx="32" cy="32" r="26"/>
+          </svg>
+          <div id="ring-text"><b id="pct">0%</b><br><span id="ring-sub">starting</span></div>
+        </div>
+        <div class="card" id="stats">
+          <span>remaining</span><b id="eta">&ndash;</b>
+          <span>elapsed</span><b id="elapsed">0s</b>
+          <span>per step</span><b id="per-step">&ndash;</b>
+          <span>timestep</span><b id="tstep">&ndash;</b>
+        </div>
+      </div>
+    </div>
+    <div class="panel" id="result">
+      <span class="grow" id="result-prompt"></span>
+      <span>seed <b id="result-seed"></b></span>
+      <span>time <b id="result-time"></b></span>
+      <a class="btn" id="download" download="image.png" href="#">Download</a>
+      <button class="btn" id="reuse" type="button">Reuse settings</button>
+    </div>
+    <div id="error"></div>
+    <div class="panel" id="history"><h2>This session</h2><div id="thumbs"></div></div>
+  </section>
+</main>
+
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  const els = {
+    prompt: $('prompt'), negative: $('negative'), steps: $('steps'), cfg: $('cfg'), size: $('size'), sampler: $('sampler'),
+    seed: $('seed'), go: $('go'), stage: $('stage'), preview: $('preview'), final: $('final'), placeholder: $('placeholder'),
+    shimmer: $('shimmer'), hud: $('hud'), phases: $('phases'), cancel: $('cancel'), bars: $('bars'), pct: $('pct'),
+    ringSub: $('ring-sub'), ringBar: document.querySelector('#ring .bar'), eta: $('eta'), elapsed: $('elapsed'),
+    perStep: $('per-step'), tstep: $('tstep'), result: $('result'), error: $('error'), thumbs: $('thumbs'),
+  };
+  const RING = 163.4;
+  let current = null;        // { id, source, params, stepTimes[], startedAt, timer }
+  let lastSeed = null;
+  const jobs = new Map();    // id -> job json (finished)
+
+  // ---- form persistence -------------------------------------------------
+  const FIELDS = ['prompt', 'negative', 'steps', 'cfg', 'size', 'sampler', 'seed'];
+  try {
+    const saved = JSON.parse(localStorage.getItem('sdcpp-form') || '{}');
+    for (const f of FIELDS) if (saved[f] !== undefined) els[f].value = saved[f];
+  } catch (e) {}
+  const saveForm = () => { try { const o = {}; for (const f of FIELDS) o[f] = els[f].value; localStorage.setItem('sdcpp-form', JSON.stringify(o)); } catch (e) {} };
+  const syncLabels = () => { $('steps-v').textContent = els.steps.value; $('cfg-v').textContent = els.cfg.value; };
+  for (const f of FIELDS) els[f].addEventListener('input', () => { syncLabels(); saveForm(); });
+  syncLabels();
+  $('dice').onclick = () => { els.seed.value = -1; saveForm(); };
+  $('lock').onclick = () => { if (lastSeed !== null) { els.seed.value = lastSeed; saveForm(); } };
+  document.addEventListener('keydown', e => { if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') { e.preventDefault(); $('form').requestSubmit(); } });
+
+  const fmt = ms => { if (ms == null || !isFinite(ms)) return '–'; const s = Math.max(0, Math.round(ms / 1000));
+    return s >= 60 ? `${Math.floor(s / 60)}m ${String(s % 60).padStart(2, '0')}s` : `${s}s`; };
+
+  // ---- status line ------------------------------------------------------
+  async function refreshStatus() {
+    try {
+      const s = await (await fetch('/api/status')).json();
+      $('status-dot').className = 'dot ' + (s.busy ? 'busy' : 'ok');
+      $('status-text').textContent = `${s.model_dir} · ${s.threads} threads` + (s.queue ? ` · ${s.queue} queued` : '');
+      if (s.current && (!current || current.id !== s.current)) attach(s.current, null);   // re-attach after a reload
+    } catch (e) { $('status-dot').className = 'dot'; $('status-text').textContent = 'server unreachable'; }
+  }
+  refreshStatus(); setInterval(refreshStatus, 5000);
+
+  // ---- stage state --------------------------------------------------------
+  function setAspect(w, h) { els.stage.className = w > h ? 'landscape' : h > w ? 'portrait' : ''; }
+  function setPhase(name) {
+    const order = ['queued', 'text', 'denoise', 'decode'];
+    const i = order.indexOf(name);
+    for (const p of els.phases.querySelectorAll('.phase')) {
+      const j = order.indexOf(p.dataset.phase);
+      p.className = 'phase' + (j < i ? ' done' : j === i ? ' active' : '');
+    }
+  }
+  function resetStage() {
+    els.placeholder.style.display = 'none';
+    els.final.style.opacity = 0; els.final.removeAttribute('src');
+    els.preview.style.opacity = 0; els.preview.removeAttribute('src'); els.preview.style.filter = 'blur(14px) saturate(1.15)';
+    els.bars.innerHTML = ''; els.bars.classList.remove('on');
+    els.ringBar.style.strokeDashoffset = RING; els.pct.textContent = '0%';
+    els.eta.textContent = '–'; els.elapsed.textContent = '0s'; els.perStep.textContent = '–'; els.tstep.textContent = '–';
+    els.result.classList.remove('on'); els.error.classList.remove('on');
+    els.hud.classList.add('on'); els.phases.classList.add('on'); els.cancel.classList.add('on');
+  }
+  function endStage() {
+    els.hud.classList.remove('on'); els.phases.classList.remove('on'); els.cancel.classList.remove('on');
+    els.shimmer.classList.remove('on'); els.bars.classList.remove('on');
+    if (current && current.timer) clearInterval(current.timer);
+    els.go.disabled = false; els.go.textContent = 'Generate';
+  }
+  function showError(msg) { els.error.textContent = msg; els.error.classList.add('on'); els.placeholder.style.display = ''; }
+
+  // ---- generation ---------------------------------------------------------
+  $('form').addEventListener('submit', async e => {
+    e.preventDefault();
+    if (current && current.source) return;
+    const [w, h] = els.size.value.split('x').map(Number);
+    const params = { prompt: els.prompt.value.trim(), negative: els.negative.value.trim(), steps: +els.steps.value,
+      cfg: +els.cfg.value, width: w, height: h, sampler: els.sampler.value, seed: +els.seed.value };
+    if (!params.prompt) { els.prompt.focus(); return; }
+    els.go.disabled = true; els.go.textContent = 'Submitting…';
+    try {
+      const r = await fetch('/api/generate', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(params) });
+      const j = await r.json();
+      if (!r.ok) throw new Error(j.error || r.statusText);
+      attach(j.id, params);
+    } catch (err) { els.go.disabled = false; els.go.textContent = 'Generate'; showError(err.message); }
+  });
+
+  function attach(id, params) {
+    if (current && current.source) current.source.close();
+    current = { id, params, stepTimes: [], startedAt: null, source: null, timer: null };
+    if (!params) fetch(`/api/jobs/${id}`).then(r => r.json()).then(j => { current.params = j; setAspect(j.width, j.height); }).catch(() => {});
+    else setAspect(params.width, params.height);
+    resetStage(); setPhase('queued');
+    els.ringSub.textContent = 'in queue'; els.go.disabled = true; els.go.textContent = 'Generating…';
+    const src = new EventSource(`/api/jobs/${id}/events`);
+    current.source = src;
+    current.timer = setInterval(() => { if (current.startedAt) els.elapsed.textContent = fmt(performance.now() - current.startedAt); }, 500);
+    src.addEventListener('queued', e => { const d = JSON.parse(e.data); els.ringSub.textContent = d.position > 0 ? `queue position ${d.position}` : 'in queue'; });
+    src.addEventListener('started', () => { current.startedAt = performance.now(); });
+    src.addEventListener('phase', e => {
+      const d = JSON.parse(e.data); setPhase(d.phase);
+      if (d.phase === 'text') { els.shimmer.classList.add('on'); els.ringSub.textContent = 'encoding prompt'; }
+      if (d.phase === 'denoise') { els.ringSub.textContent = 'denoising'; }
+      if (d.phase === 'decode') { els.shimmer.classList.add('on'); els.ringSub.textContent = 'decoding to pixels'; els.preview.style.filter = 'blur(2px)';
+        els.ringBar.style.strokeDashoffset = 0; els.pct.textContent = '100%'; }
+    });
+    src.addEventListener('step', e => {
+      const d = JSON.parse(e.data);
+      els.shimmer.classList.remove('on');
+      const frac = d.step / d.total;
+      els.ringBar.style.strokeDashoffset = RING * (1 - frac * 0.97);
+      els.pct.textContent = Math.round(frac * 100) + '%';
+      els.ringSub.textContent = `step ${d.step} of ${d.total}`;
+      els.eta.textContent = '≈ ' + fmt(d.eta_ms); els.elapsed.textContent = fmt(d.elapsed_ms);
+      els.perStep.textContent = (d.step_ms / 1000).toFixed(1) + 's'; els.tstep.textContent = d.timestep.toFixed(0);
+      if (d.preview) {
+        els.preview.src = d.preview; els.preview.style.opacity = 1;
+        // Sharpen as the latent converges: heavy blur early, nearly none at the end.
+        const blur = 2 + 14 * Math.pow(1 - frac, 1.6);
+        els.preview.style.filter = `blur(${blur.toFixed(1)}px) saturate(1.15)`;
+      }
+      current.stepTimes.push(d.step_ms);
+      const max = Math.max(...current.stepTimes);
+      els.bars.innerHTML = current.stepTimes.map(t => `<i style="height:${Math.max(8, 100 * t / max)}%"></i>`).join('');
+      els.bars.classList.add('on');
+    });
+    src.addEventListener('done', e => {
+      const d = JSON.parse(e.data);
+      lastSeed = d.seed;
+      els.final.onload = () => { els.final.style.opacity = 1; setTimeout(() => { els.preview.style.opacity = 0; }, 400); };
+      els.final.src = d.image;
+      setPhase('done'); endStage();
+      const p = current.params || {};
+      showResult({ ...p, id, seed: d.seed, seconds: d.seconds, image: d.image });
+      src.close(); current.source = null;
+      fetch(`/api/jobs/${id}`).then(r => r.json()).then(addThumb).catch(() => {});
+      refreshStatus();
+    });
+    src.addEventListener('cancelled', () => { endStage(); els.placeholder.style.display = ''; src.close(); current.source = null; refreshStatus(); });
+    src.addEventListener('error', e => {
+      if (e.data) { try { showError(JSON.parse(e.data).message); } catch (_) { showError('generation failed'); } endStage(); src.close(); current.source = null; }
+      else if (src.readyState === EventSource.CLOSED) { endStage(); }
+    });
+  }
+  els.cancel.onclick = () => { if (current) fetch(`/api/jobs/${current.id}/cancel`, { method: 'POST' }); els.ringSub.textContent = 'cancelling…'; };
+
+  function showResult(j) {
+    $('result-prompt').textContent = j.prompt || '';
+    $('result-seed').textContent = j.seed; $('result-time').textContent = (j.seconds || 0).toFixed(1) + 's';
+    $('download').href = j.image; $('download').download = `sd-${j.seed}.png`;
+    $('reuse').onclick = () => {
+      els.prompt.value = j.prompt || ''; els.negative.value = j.negative || ''; els.steps.value = j.steps; els.cfg.value = j.cfg;
+      els.sampler.value = j.sampler; els.seed.value = j.seed;
+      const sz = `${j.width}x${j.height}`; if ([...els.size.options].some(o => o.value === sz)) els.size.value = sz;
+      syncLabels(); saveForm(); els.prompt.focus();
+    };
+    els.result.classList.add('on');
+    for (const t of els.thumbs.children) t.classList.toggle('active', t.dataset.id === j.id);
+  }
+
+  // ---- history ----------------------------------------------------------------
+  function addThumb(j) {
+    if (!j || !j.image || jobs.has(j.id)) return;
+    jobs.set(j.id, j);
+    const t = document.createElement('div');
+    t.className = 'thumb'; t.dataset.id = j.id; t.title = `${j.prompt}\nseed ${j.seed} · ${j.steps} steps · cfg ${j.cfg}`;
+    t.innerHTML = `<img src="${j.image}" alt="">`;
+    t.onclick = () => {
+      if (current && current.source) return;
+      resetStage(); endStage(); setAspect(j.width, j.height);
+      els.final.src = j.image; els.final.style.opacity = 1; showResult(j);
+    };
+    els.thumbs.prepend(t);
+    for (const x of els.thumbs.children) x.classList.toggle('active', x.dataset.id === j.id);
+  }
+  fetch('/api/jobs').then(r => r.json()).then(list => {
+    list.reverse().forEach(addThumb);
+    // Show the newest finished image unless a generation is in progress.
+    const newest = els.thumbs.firstElementChild;
+    if (newest && !(current && current.source)) newest.click();
+  }).catch(() => {});
+})();
+</script>
+</body>
+</html>

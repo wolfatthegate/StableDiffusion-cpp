@@ -1,0 +1,8 @@
+torch>=2.1
+diffusers>=0.27
+transformers>=4.38
+safetensors>=0.4
+huggingface_hub>=0.20
+pyyaml>=6
+pillow>=10
+numpy>=1.24
