@@ -36,6 +36,10 @@ weight layout, so any SD 1.x checkpoint in that format works.
 12. [Limitations](#limitations)
 13. [Troubleshooting](#troubleshooting)
 
+For profiling results, processor differences, using fine-tuned weights, and a
+map of where to change the code for speed or quality, see
+[docs/IMPROVEMENTS.md](docs/IMPROVEMENTS.md).
+
 ## Quick start
 
 ```sh
@@ -439,7 +443,8 @@ zlib is needed. A 512x512 image is about 790 KB.
 
 ## Performance
 
-Measured on a 10-core Apple Silicon Mac with the built-in GEMM:
+Measured on an Apple M1 Max (8 performance and 2 efficiency cores) with the
+built-in GEMM:
 
 | stage | time |
 |---|---|
@@ -453,10 +458,15 @@ Peak memory footprint at 512x512 is about 4.1 GB, and the maximum resident
 set size reported by the OS is about 5.4 GB because the memory-mapped weight
 file is counted too.
 
+These numbers come from an Apple M1 Max and will differ on other processors.
+[docs/IMPROVEMENTS.md](docs/IMPROVEMENTS.md) has the full profile, an
+Accelerate comparison (2.5 s per step instead of 4.3 s), the reasons results
+vary between machines, and a code map for making the model faster or better.
+
 Ways to make it faster, roughly in order of payoff:
 
-- Build with `make ACCELERATE=1` on macOS to use Apple's tuned BLAS. This
-  has not been benchmarked here.
+- Build with `make ACCELERATE=1` on macOS to use Apple's tuned BLAS. It is
+  measured at 1.7x faster per step, with output within one pixel level.
 - Use `--cfg 1` to skip the unconditional pass, at a cost in prompt adherence.
 - Use fewer steps; DDIM is usable at 15.
 - Generate at a smaller size such as 384x384.
