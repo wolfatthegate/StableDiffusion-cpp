@@ -109,15 +109,44 @@ def prune_checkpoints(run_dir: str, keep: int) -> None:
 
 @torch.no_grad()
 def encode_latents(vae, pixel_values: torch.Tensor) -> torch.Tensor:
-    return vae.encode(pixel_values).latent_dist.sample() * vae.config.scaling_factor
+    z = vae.encode(pixel_values).latent_dist.sample()
+    shift = getattr(vae.config, "shift_factor", None) or 0.0
+    return (z - shift) * vae.config.scaling_factor
+
+
+def encode_text(comps: Components, input_ids: torch.Tensor, grad: bool):
+    """Returns the conditioning the generator expects.
+    sd1: CLIP last hidden state [B, 77, 768].
+    z-image: a list of per-sample Qwen3 penultimate hidden states [L_i, 2560] without padding."""
+    ctx = torch.enable_grad() if grad else torch.no_grad()
+    with ctx:
+        if comps.family == "z-image":
+            pad_id = comps.tokenizer.pad_token_id
+            mask = input_ids != pad_id
+            out = comps.text_encoder(input_ids=input_ids, attention_mask=mask, output_hidden_states=True)
+            hidden = out.hidden_states[-2]
+            return [hidden[i][mask[i]] for i in range(hidden.shape[0])]
+        return comps.text_encoder(input_ids)[0]
+
+
+def flow_sigmas(batch: int, shift: float, device) -> torch.Tensor:
+    """Logit-normal timestep sampling (SD3 / FLUX recipe) followed by the
+    scheduler's static shift, so training covers the same sigmas inference uses."""
+    u = torch.sigmoid(torch.randn(batch, device=device))
+    return shift * u / (1.0 + (shift - 1.0) * u)
 
 
 @torch.no_grad()
 def generate_samples(cfg: Config, comps: Components, device: torch.device, out_dir: str, step: int) -> None:
     from diffusers import DDIMScheduler, StableDiffusionPipeline
-    pipe = StableDiffusionPipeline(vae=comps.vae, text_encoder=comps.text_encoder, tokenizer=comps.tokenizer, unet=comps.unet,
-                                   scheduler=DDIMScheduler.from_config(comps.noise_scheduler.config),
-                                   safety_checker=None, feature_extractor=None, requires_safety_checker=False)
+    if comps.family == "z-image":
+        from diffusers import ZImagePipeline
+        pipe = ZImagePipeline(scheduler=comps.noise_scheduler, vae=comps.vae, text_encoder=comps.text_encoder,
+                              tokenizer=comps.tokenizer, transformer=comps.unet)
+    else:
+        pipe = StableDiffusionPipeline(vae=comps.vae, text_encoder=comps.text_encoder, tokenizer=comps.tokenizer, unet=comps.unet,
+                                       scheduler=DDIMScheduler.from_config(comps.noise_scheduler.config),
+                                       safety_checker=None, feature_extractor=None, requires_safety_checker=False)
     pipe.set_progress_bar_config(disable=True)
     os.makedirs(out_dir, exist_ok=True)
     was_training = comps.unet.training
@@ -145,7 +174,10 @@ def train(cfg: Config) -> str:
 
     comps = load_components(cfg)
     setup = apply_weights_config(cfg, comps)
+    log.info(f"family: {comps.family}, base weights {str(comps.weights_dtype).replace('torch.', '')}")
     log.info(setup.summary(comps))
+    is_flow = comps.family == "z-image"
+    flow_shift = float(getattr(comps.noise_scheduler.config, "shift", 3.0)) if is_flow else 0.0
 
     comps.vae.to(device).eval()
     comps.text_encoder.to(device)
@@ -185,7 +217,7 @@ def train(cfg: Config) -> str:
         step = load_checkpoint(cfg.checkpoint.resume, comps, setup, optimizer, lr_sched, ema)
         log.info(f"resumed from {cfg.checkpoint.resume} at step {step}")
 
-    T = comps.noise_scheduler.config.num_train_timesteps
+    T = int(getattr(comps.noise_scheduler.config, "num_train_timesteps", 1000))
     loss_ema = None
     t_last = time.time()
     data_iter = iter(loader)
@@ -214,22 +246,31 @@ def train(cfg: Config) -> str:
             noise = torch.randn_like(latents)
             if cfg.train.noise_offset > 0:
                 noise = noise + cfg.train.noise_offset * torch.randn(latents.shape[0], latents.shape[1], 1, 1, device=device)
-            timesteps = torch.randint(0, T, (latents.shape[0],), device=device, dtype=torch.long)
-            noisy = comps.noise_scheduler.add_noise(latents, noise, timesteps)
 
             with autocast_context(device, cfg.train.precision):
-                if te_trainable:
-                    hidden = comps.text_encoder(input_ids)[0]
+                hidden = encode_text(comps, input_ids, te_trainable)
+                if is_flow:
+                    # x_t = (1 - sigma) x0 + sigma noise; the model predicts x0 - noise
+                    # (the pipeline negates its output before the Euler step).
+                    sigmas = flow_sigmas(latents.shape[0], flow_shift, device)
+                    s = sigmas[:, None, None, None]
+                    noisy = (1.0 - s) * latents + s * noise
+                    t_model = 1.0 - sigmas
+                    outs = comps.unet(x=[n.unsqueeze(1).to(comps.weights_dtype) for n in noisy], t=t_model,
+                                      cap_feats=[h.to(comps.weights_dtype) for h in hidden], return_dict=False)[0]
+                    pred = torch.stack([o.squeeze(1) for o in outs])
+                    target = latents - noise
+                    timesteps = (sigmas * T).long()
                 else:
-                    with torch.no_grad():
-                        hidden = comps.text_encoder(input_ids)[0]
-                pred = comps.unet(noisy, timesteps, encoder_hidden_states=hidden).sample
-            if comps.noise_scheduler.config.prediction_type == "v_prediction":
-                target = comps.noise_scheduler.get_velocity(latents, noise, timesteps)
-            else:
-                target = noise
+                    timesteps = torch.randint(0, T, (latents.shape[0],), device=device, dtype=torch.long)
+                    noisy = comps.noise_scheduler.add_noise(latents, noise, timesteps)
+                    pred = comps.unet(noisy.to(comps.weights_dtype), timesteps, encoder_hidden_states=hidden.to(comps.weights_dtype)).sample
+                    if comps.noise_scheduler.config.prediction_type == "v_prediction":
+                        target = comps.noise_scheduler.get_velocity(latents, noise, timesteps)
+                    else:
+                        target = noise
             loss = F.mse_loss(pred.float(), target.float(), reduction="none").mean(dim=(1, 2, 3))
-            if cfg.train.snr_gamma:
+            if cfg.train.snr_gamma and not is_flow:
                 loss = loss * snr_weights(comps.noise_scheduler, timesteps, cfg.train.snr_gamma)
             loss = loss.mean() / cfg.train.grad_accum
             scaler.scale(loss).backward()

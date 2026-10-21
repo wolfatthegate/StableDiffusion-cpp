@@ -151,6 +151,129 @@ static void test_norms(std::mt19937& rng) {
 }
 
 // Times a GEMM shaped like a 3x3 conv on 64x64 latents with 320 channels.
+// gemm_nt_bf16 against gemm_nt on the same (bf16-rounded) B.
+static void test_gemm_bf16(std::mt19937& rng, int M, int N, int K) {
+    std::vector<float> A((size_t)M * K), Bf((size_t)N * K), C1((size_t)M * N), C2((size_t)M * N), bias(N);
+    std::vector<uint16_t> Bh((size_t)N * K);
+    fill(A, rng); fill(Bf, rng); fill(bias, rng);
+    for (size_t i = 0; i < Bf.size(); ++i) { Bh[i] = f32_to_bf16(Bf[i]); Bf[i] = bf16_to_f32(Bh[i]); }
+    gemm_nt(M, N, K, A.data(), K, Bf.data(), K, C1.data(), N, bias.data());
+    gemm_nt_bf16(M, N, K, A.data(), K, Bh.data(), K, C2.data(), N, bias.data());
+    double err = 0;
+    for (size_t i = 0; i < C1.size(); ++i) err = std::max(err, (double)std::fabs(C1[i] - C2[i]));
+    char name[64];
+    std::snprintf(name, sizeof name, "gemm_bf16 %dx%dx%d", M, N, K);
+    check(name, err, 1e-4 * std::sqrt((double)K));
+}
+
+// bf16 round trip and rounding direction.
+static void test_bf16() {
+    double err = 0;
+    for (float v : {0.0f, 1.0f, -1.5f, 3.14159f, 1e-3f, 65504.0f, 1e-30f}) {
+        float r = bf16_to_f32(f32_to_bf16(v));
+        err = std::max(err, (double)std::fabs(r - v) / (std::fabs(v) + 1e-30));
+    }
+    check("bf16 round trip (rel)", err, 1.0 / 128);  // 8 bits of mantissa
+}
+
+static void test_rms_rope_swiglu(std::mt19937& rng) {
+    const int S = 5, H = 3, D = 8;
+    Tensor x({S, H * D}), g({H * D}), gd({D});
+    fill(x.data, rng); fill(g.data, rng); fill(gd.data, rng);
+    Tensor y = rms_norm(x, &g, 1e-6f);
+    double err = 0;
+    for (int r = 0; r < S; ++r) {
+        double ss = 0;
+        for (int i = 0; i < H * D; ++i) ss += (double)x.ptr()[r * H * D + i] * x.ptr()[r * H * D + i];
+        double rstd = 1.0 / std::sqrt(ss / (H * D) + 1e-6);
+        for (int i = 0; i < H * D; ++i) err = std::max(err, std::fabs(x.ptr()[r * H * D + i] * rstd * g.ptr()[i] - y.ptr()[r * H * D + i]));
+    }
+    check("rms_norm", err, 1e-5);
+
+    Tensor xh = x;
+    rms_norm_heads_(xh, D, &gd, 1e-6f);
+    err = 0;
+    for (int r = 0; r < S * H; ++r) {
+        double ss = 0;
+        for (int i = 0; i < D; ++i) ss += (double)x.ptr()[r * D + i] * x.ptr()[r * D + i];
+        double rstd = 1.0 / std::sqrt(ss / D + 1e-6);
+        for (int i = 0; i < D; ++i) err = std::max(err, std::fabs(x.ptr()[r * D + i] * rstd * gd.ptr()[i] - xh.ptr()[r * D + i]));
+    }
+    check("rms_norm_heads_", err, 1e-5);
+
+    // RoPE, rotate_half convention: pair (i, i + D/2) rotated by angle theta_i.
+    Tensor cs({S, D}), sn({S, D});
+    std::vector<double> ang((size_t)S * D / 2);
+    for (int s = 0; s < S; ++s)
+        for (int i = 0; i < D / 2; ++i) {
+            double a = s * std::pow(10000.0, -2.0 * i / D);
+            ang[s * D / 2 + i] = a;
+            cs.ptr()[s * D + i] = cs.ptr()[s * D + i + D / 2] = (float)std::cos(a);
+            sn.ptr()[s * D + i] = sn.ptr()[s * D + i + D / 2] = (float)std::sin(a);
+        }
+    Tensor xr = x;
+    rope_(xr, D, cs, sn, false);
+    err = 0;
+    for (int s = 0; s < S; ++s)
+        for (int h = 0; h < H; ++h)
+            for (int i = 0; i < D / 2; ++i) {
+                double a = x.ptr()[(s * H + h) * D + i], b = x.ptr()[(s * H + h) * D + i + D / 2], t = ang[s * D / 2 + i];
+                err = std::max(err, std::fabs(a * std::cos(t) - b * std::sin(t) - xr.ptr()[(s * H + h) * D + i]));
+                err = std::max(err, std::fabs(b * std::cos(t) + a * std::sin(t) - xr.ptr()[(s * H + h) * D + i + D / 2]));
+            }
+    check("rope rotate_half", err, 1e-5);
+
+    // RoPE, interleaved convention: pair (2i, 2i+1); tables hold each angle twice.
+    Tensor cs2({S, D}), sn2({S, D});
+    for (int s = 0; s < S; ++s)
+        for (int i = 0; i < D / 2; ++i) {
+            double a = ang[s * D / 2 + i];
+            cs2.ptr()[s * D + 2 * i] = cs2.ptr()[s * D + 2 * i + 1] = (float)std::cos(a);
+            sn2.ptr()[s * D + 2 * i] = sn2.ptr()[s * D + 2 * i + 1] = (float)std::sin(a);
+        }
+    Tensor xi = x;
+    rope_(xi, D, cs2, sn2, true);
+    err = 0;
+    for (int s = 0; s < S; ++s)
+        for (int h = 0; h < H; ++h)
+            for (int i = 0; i < D / 2; ++i) {
+                double a = x.ptr()[(s * H + h) * D + 2 * i], b = x.ptr()[(s * H + h) * D + 2 * i + 1], t = ang[s * D / 2 + i];
+                err = std::max(err, std::fabs(a * std::cos(t) - b * std::sin(t) - xi.ptr()[(s * H + h) * D + 2 * i]));
+                err = std::max(err, std::fabs(b * std::cos(t) + a * std::sin(t) - xi.ptr()[(s * H + h) * D + 2 * i + 1]));
+            }
+    check("rope interleaved", err, 1e-5);
+
+    Tensor u({S, H * D});
+    fill(u.data, rng);
+    Tensor sw = swiglu(x, u);
+    err = 0;
+    for (int i = 0; i < S * H * D; ++i) {
+        double gv = x.ptr()[i];
+        err = std::max(err, std::fabs(gv / (1.0 + std::exp(-gv)) * u.ptr()[i] - sw.ptr()[i]));
+    }
+    check("swiglu", err, 1e-5);
+}
+
+// Grouped-query attention: 4 query heads sharing 2 key/value heads.
+static void test_gqa(std::mt19937& rng) {
+    const int N = 1, S = 6, heads = 4, kv = 2, d = 4;
+    Tensor q({N, S, heads * d}), k({N, S, kv * d}), v({N, S, kv * d});
+    fill(q.data, rng); fill(k.data, rng); fill(v.data, rng);
+    Tensor o = attention(q, k, v, heads, true, kv);
+    // Expand k/v to all heads and compare with the plain path.
+    Tensor kx({N, S, heads * d}), vx({N, S, heads * d});
+    for (int s = 0; s < S; ++s)
+        for (int h = 0; h < heads; ++h)
+            for (int t = 0; t < d; ++t) {
+                kx.ptr()[s * heads * d + h * d + t] = k.ptr()[s * kv * d + (h / (heads / kv)) * d + t];
+                vx.ptr()[s * heads * d + h * d + t] = v.ptr()[s * kv * d + (h / (heads / kv)) * d + t];
+            }
+    Tensor o2 = attention(q, kx, vx, heads, true);
+    double err = 0;
+    for (int i = 0; i < o.numel(); ++i) err = std::max(err, (double)std::fabs(o.ptr()[i] - o2.ptr()[i]));
+    check("attention gqa causal", err, 1e-6);
+}
+
 static void bench_gemm() {
     const int M = 4096, N = 320, K = 2880;  // a typical UNet conv GEMM at 64x64 latents
     std::vector<float> A((size_t)M * K, 0.5f), B((size_t)N * K, 0.25f), C((size_t)M * N);
@@ -161,6 +284,18 @@ static void bench_gemm() {
     double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count() / reps;
     std::printf("gemm %dx%dx%d: %.1f ms  %.1f GFLOP/s on %d threads\n", M, N, K, s * 1e3, 2.0 * M * N * K / s / 1e9,
                 num_threads());
+}
+
+static void bench_gemm_bf16() {
+    const int M = 4096, N = 3840, K = 3840;  // one Z-Image attention projection at 1024x1024
+    std::vector<float> A((size_t)M * K, 0.5f), C((size_t)M * N);
+    std::vector<uint16_t> B((size_t)N * K, f32_to_bf16(0.25f));
+    gemm_nt_bf16(M, N, K, A.data(), K, B.data(), K, C.data(), N);
+    auto t0 = std::chrono::steady_clock::now();
+    const int reps = 3;
+    for (int r = 0; r < reps; ++r) gemm_nt_bf16(M, N, K, A.data(), K, B.data(), K, C.data(), N);
+    double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count() / reps;
+    std::printf("gemm_bf16 %dx%dx%d: %.1f ms  %.1f GFLOP/s\n", M, N, K, s * 1e3, 2.0 * M * N * K / s / 1e9);
 }
 
 int main() {
@@ -177,7 +312,13 @@ int main() {
     test_attention(rng, 1, 11, 5, 2, 4, false);
     test_attention(rng, 1, 7, 7, 1, 16, true);
     test_norms(rng);
+    test_bf16();
+    test_gemm_bf16(rng, 37, 53, 129);
+    test_gemm_bf16(rng, 130, 257, 300);
+    test_rms_rope_swiglu(rng);
+    test_gqa(rng);
     bench_gemm();
+    bench_gemm_bf16();
     std::printf(failures ? "\n%d FAILED\n" : "\nall ok\n", failures);
     return failures ? 1 : 0;
 }

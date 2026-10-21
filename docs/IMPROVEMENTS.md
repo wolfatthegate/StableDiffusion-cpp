@@ -4,6 +4,14 @@ This document records where the time goes in StableDiffusion-cpp, how results
 change from one processor to another, and which parts of the code to change
 to get better or faster output.
 
+It was written for the Stable Diffusion 1.5 model. The project has since
+adopted Z-Image as its main model; see
+[ADR-001](ADR-001-model-upgrade.md) for that decision, its measured
+performance and its code. The SD 1.5 profile and most of the kernel advice
+below still apply: Z-Image's time is also dominated by `gemm_nt`
+(through the bf16 path `gemm_nt_bf16`), and attention tiling matters even
+more at 4,096 image tokens.
+
 Line references point to commit `c77ed85` on `main`. They will drift as the
 code changes, so search for the function name if a link lands on the wrong
 line.

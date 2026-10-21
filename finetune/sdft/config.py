@@ -31,6 +31,13 @@ class ModelConfig:
     # Where to fetch the small config.json files from when `base` is a local
     # directory that only contains weights (as scripts/download_sd15.sh makes).
     config_repo: str = "stable-diffusion-v1-5/stable-diffusion-v1-5"
+    # "auto" reads model_index.json; "sd1" = Stable Diffusion 1.x (UNet),
+    # "z-image" = Z-Image (S3-DiT transformer, Qwen3 text encoder, FLUX VAE).
+    family: str = "auto"
+    # Precision of the frozen base weights: "fp32", or "bf16" to halve memory
+    # (the default for Z-Image, whose generator is 6B parameters). Trained
+    # parameters and LoRA adapters are always float32.
+    weights_dtype: str = "auto"
 
 
 @dataclass
@@ -52,7 +59,8 @@ class DataConfig:
 
 @dataclass
 class ComponentWeights:
-    """Which parameters of one component (unet or text_encoder) to train.
+    """Which parameters of one component to train. `unet` is the image
+    generator: the UNet for SD 1.x, the transformer for Z-Image.
 
     `include` and `exclude` are regular expressions matched against parameter
     names such as ``down_blocks.0.attentions.0.transformer_blocks.0.attn1.to_q.weight``
@@ -152,6 +160,8 @@ class Config:
         _check(t.lr_scheduler in ("constant", "linear", "cosine"), "train.lr_scheduler must be constant, linear or cosine")
         _check(t.precision in ("fp32", "fp16", "bf16"), "train.precision must be fp32, fp16 or bf16")
         _check(t.device in ("auto", "cuda", "mps", "cpu"), "train.device must be auto, cuda, mps or cpu")
+        _check(self.model.family in ("auto", "sd1", "z-image"), "model.family must be auto, sd1 or z-image")
+        _check(self.model.weights_dtype in ("auto", "fp32", "bf16"), "model.weights_dtype must be auto, fp32 or bf16")
         _check(t.ema_decay is None or 0 < t.ema_decay < 1, "train.ema_decay must be in (0, 1)")
         _check(d.resolution % 8 == 0 and d.resolution >= 64, "data.resolution must be a multiple of 8 and >= 64")
         _check(0 <= d.caption_dropout <= 1, "data.caption_dropout must be in [0, 1]")

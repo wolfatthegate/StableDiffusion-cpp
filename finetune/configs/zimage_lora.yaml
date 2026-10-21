@@ -1,0 +1,55 @@
+# LoRA fine-tune of the Z-Image transformer (use the non-distilled base,
+# Tongyi-MAI/Z-Image, for training; Z-Image-Turbo is a distilled model and
+# trains poorly). The frozen 6B base stays in bf16 (12 GB); adapters are fp32.
+# Needs a GPU or Apple Silicon with 24 GB or more at 1024, 16 GB at 512.
+model:
+  base: models/z-image            # scripts/download_zimage.sh with ZIMAGE_REPO=Tongyi-MAI/Z-Image
+  family: z-image
+  weights_dtype: bf16
+
+data:
+  path: data/my-images
+  resolution: 1024
+  caption_dropout: 0.1
+  cache_latents: true
+
+weights:
+  method: lora
+  unet:                           # "unet" = the image generator (the transformer here)
+    train: true
+    # include: ["^layers\\."]      # main blocks only; refiners stay frozen
+  text_encoder:
+    train: false                  # the 4B Qwen3 encoder is normally left alone
+  lora:
+    rank: 16
+    alpha: 16
+    unet_targets: [to_q, to_k, to_v, to_out.0]   # add w1, w2, w3 for the feed-forward layers
+
+train:
+  steps: 1500
+  batch_size: 1
+  grad_accum: 4
+  lr: 1.0e-4
+  lr_scheduler: cosine
+  warmup_steps: 50
+  precision: fp32                 # the bf16 base needs no autocast
+  gradient_checkpointing: true
+  seed: 0
+
+checkpoint:
+  dir: runs/zimage-lora
+  every: 250
+  keep: 3
+
+logging:
+  every: 10
+  sample_every: 250
+  sample_prompts: ["a photo of a cat in the style of the training images"]
+  sample_steps: 30
+  sample_cfg: 4.0
+  sample_size: 1024
+
+export:
+  output_dir: models/z-image-lora
+  fuse_lora: true
+  save_lora: true

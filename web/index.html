@@ -136,22 +136,24 @@
     </label>
     <div class="row">
       <label><span>Steps <b id="steps-v">20</b></span><input type="range" id="steps" min="1" max="60" value="20"></label>
-      <label><span>Guidance <b id="cfg-v">7.5</b></span><input type="range" id="cfg" min="1" max="15" step="0.5" value="7.5"></label>
+      <label><span>Guidance <b id="cfg-v">7.5</b> <small id="cfg-hint" style="color:var(--muted)"></small></span><input type="range" id="cfg" min="0" max="15" step="0.5" value="7.5"></label>
     </div>
     <div class="row">
       <label>Size
         <select id="size">
+          <option value="1024x1024">1024 &times; 1024 (square)</option>
+          <option value="832x1216">832 &times; 1216 (portrait)</option>
+          <option value="1216x832">1216 &times; 832 (landscape)</option>
+          <option value="768x768">768 &times; 768</option>
           <option value="512x512">512 &times; 512 (square)</option>
           <option value="512x768">512 &times; 768 (portrait)</option>
           <option value="768x512">768 &times; 512 (landscape)</option>
-          <option value="448x640">448 &times; 640</option>
-          <option value="640x448">640 &times; 448</option>
           <option value="384x384">384 &times; 384 (fast)</option>
           <option value="256x256">256 &times; 256 (test)</option>
         </select>
       </label>
       <label>Sampler
-        <select id="sampler"><option value="euler">Euler</option><option value="ddim">DDIM</option></select>
+        <select id="sampler"><option value="euler">Euler</option><option value="ddim">DDIM</option><option value="flow">Flow (Euler)</option></select>
       </label>
     </div>
     <div class="row3">
@@ -242,11 +244,30 @@
     return s >= 60 ? `${Math.floor(s / 60)}m ${String(s % 60).padStart(2, '0')}s` : `${s}s`; };
 
   // ---- status line ------------------------------------------------------
+  let family = null;
+  function applyFamily(s) {
+    if (family === s.family) return;
+    family = s.family;
+    // Restrict the sampler list to what the model supports and, the first
+    // time this model is seen, take its defaults.
+    for (const o of els.sampler.options) o.hidden = !s.samplers.includes(o.value);
+    const seen = (() => { try { return localStorage.getItem('sdcpp-family'); } catch (e) { return null; } })();
+    if (seen !== s.family || !s.samplers.includes(els.sampler.value)) {
+      els.steps.value = s.defaults.steps; els.cfg.value = s.defaults.cfg; els.sampler.value = s.defaults.sampler;
+      const sz = `${s.defaults.width}x${s.defaults.height}`;
+      if ([...els.size.options].some(o => o.value === sz)) els.size.value = sz;
+      syncLabels(); saveForm();
+      try { localStorage.setItem('sdcpp-family', s.family); } catch (e) {}
+    }
+    $('cfg-hint').textContent = s.family === 'z-image' ? '0 = off (Turbo)' : '';
+  }
   async function refreshStatus() {
     try {
       const s = await (await fetch('/api/status')).json();
+      applyFamily(s);
       $('status-dot').className = 'dot ' + (s.busy ? 'busy' : 'ok');
-      $('status-text').textContent = `${s.model_dir} · ${s.threads} threads` + (s.queue ? ` · ${s.queue} queued` : '');
+      const name = s.family === 'z-image' ? 'Z-Image' : 'SD 1.x';
+      $('status-text').textContent = `${name} · ${s.model_dir} · ${s.threads} threads` + (s.queue ? ` · ${s.queue} queued` : '');
       if (s.current && (!current || current.id !== s.current)) attach(s.current, null);   // re-attach after a reload
     } catch (e) { $('status-dot').className = 'dot'; $('status-text').textContent = 'server unreachable'; }
   }

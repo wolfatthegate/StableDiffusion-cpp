@@ -13,6 +13,7 @@
 //   POST /api/jobs/<id>/cancel     stops after the current step
 //   GET  /api/jobs/<id>/image.png  the finished image
 // ============================================================================
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -209,8 +210,9 @@ private:
                 step_total_ms += pr.step_seconds * 1000.0;
                 steps_done = pr.step;
                 const double avg = step_total_ms / steps_done;
-                // Decoding takes about 1.7 UNet steps at the same resolution.
-                const double eta = avg * (pr.total - pr.step) + 1.7 * avg;
+                // Decoding costs roughly 1.7 SD steps, or 0.3 Z-Image steps.
+                const double decode_steps = pipe_.family() == Pipeline::Family::ZImage ? 0.3 : 1.7;
+                const double eta = avg * (pr.total - pr.step) + decode_steps * avg;
                 std::ostringstream js;
                 js << "{\"step\":" << pr.step << ",\"total\":" << pr.total << ",\"timestep\":" << pr.timestep
                    << ",\"step_ms\":" << (long)(pr.step_seconds * 1000.0) << ",\"elapsed_ms\":" << (long)(now_ms() - t0)
@@ -254,11 +256,11 @@ private:
     }
 };
 
-// Reads GenerateParams from a JSON object; missing fields keep their defaults.
-GenerateParams params_from_json(const std::string& body) {
+// Reads GenerateParams from a JSON object; missing fields keep the defaults.
+GenerateParams params_from_json(const std::string& body, const GenerateParams& defaults) {
     Json j = parse_json(body);
     if (j.type != Json::Object) throw std::runtime_error("expected a JSON object");
-    GenerateParams p;
+    GenerateParams p = defaults;
     auto str = [&](const char* k, std::string& out) {
         if (const Json* v = j.find(k)) {
             if (v->type != Json::String) throw std::runtime_error(std::string(k) + " must be a string");
@@ -370,10 +372,19 @@ int main(int argc, char** argv) try {
     });
 
     server.route("GET", "/api/status", [&](const http::Request&, http::Connection& c) {
+        const GenerateParams d = pipe.defaults();
         std::ostringstream js;
-        js << "{\"model_dir\":" << json_quote(pipe.model_dir()) << ",\"threads\":" << num_threads()
-           << ",\"queue\":" << queue.pending() << ",\"busy\":" << (queue.busy() ? "true" : "false")
-           << ",\"current\":" << json_quote(queue.current()) << "}";
+        js << "{\"model_dir\":" << json_quote(pipe.model_dir()) << ",\"family\":" << json_quote(pipe.family_name())
+           << ",\"threads\":" << num_threads() << ",\"queue\":" << queue.pending()
+           << ",\"busy\":" << (queue.busy() ? "true" : "false") << ",\"current\":" << json_quote(queue.current())
+           << ",\"defaults\":{\"steps\":" << d.steps << ",\"cfg\":" << d.cfg << ",\"width\":" << d.width
+           << ",\"height\":" << d.height << ",\"sampler\":" << json_quote(d.sampler) << "},\"samplers\":[";
+        bool first = true;
+        for (const auto& s : pipe.samplers()) {
+            js << (first ? "" : ",") << json_quote(s);
+            first = false;
+        }
+        js << "]}";
         c.send_json(200, js.str());
     });
 
@@ -390,12 +401,14 @@ int main(int argc, char** argv) try {
     server.route("POST", "/api/generate", [&](const http::Request& req, http::Connection& c) {
         GenerateParams p;
         try {
-            p = params_from_json(req.body);
+            p = params_from_json(req.body, pipe.defaults());
             if (p.prompt.empty()) throw std::runtime_error("prompt is empty");
             if (p.steps < 1 || p.steps > 500) throw std::runtime_error("steps must be between 1 and 500");
             if (p.width % 64 || p.height % 64 || p.width < 64 || p.height < 64 || p.width > 2048 || p.height > 2048)
                 throw std::runtime_error("width and height must be multiples of 64 between 64 and 2048");
-            if (p.sampler != "euler" && p.sampler != "ddim") throw std::runtime_error("sampler must be euler or ddim");
+            const auto samplers = pipe.samplers();
+            if (std::find(samplers.begin(), samplers.end(), p.sampler) == samplers.end())
+                throw std::runtime_error("sampler not available for this model");
         } catch (const std::exception& e) {
             c.send_json(400, "{\"error\":" + json_quote(e.what()) + "}");
             return;

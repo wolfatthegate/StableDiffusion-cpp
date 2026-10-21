@@ -66,9 +66,10 @@ def load_image(path: str, resolution: int, center_crop: bool, random_flip: bool,
 
 
 class ImageCaptionDataset(Dataset):
-    def __init__(self, cfg: DataConfig, tokenizer, seed: int = 0):
+    def __init__(self, cfg: DataConfig, tokenizer, seed: int = 0, max_tokens: int = 512):
         self.cfg = cfg
         self.tokenizer = tokenizer
+        self.max_tokens = max_tokens
         if not os.path.isdir(cfg.path):
             raise FileNotFoundError(f"data.path '{cfg.path}' is not a directory")
         self.files = find_images(cfg.path)
@@ -81,6 +82,14 @@ class ImageCaptionDataset(Dataset):
         return len(self.files) * max(1, self.cfg.repeats)
 
     def tokenize(self, caption: str) -> torch.Tensor:
+        # CLIP: fixed 77 ids. Qwen (Z-Image): chat-template text, padded to
+        # max_tokens with the pad id; the trainer drops the padding again.
+        if hasattr(self.tokenizer, "apply_chat_template") and getattr(self, "chat_template", True) and \
+                "Qwen" in type(self.tokenizer).__name__:
+            text = self.tokenizer.apply_chat_template([{"role": "user", "content": caption}], tokenize=False,
+                                                      add_generation_prompt=True, enable_thinking=True)
+            return self.tokenizer(text, padding="max_length", max_length=self.max_tokens, truncation=True,
+                                  return_tensors="pt").input_ids[0]
         return self.tokenizer(caption, padding="max_length", max_length=self.tokenizer.model_max_length,
                               truncation=True, return_tensors="pt").input_ids[0]
 

@@ -33,8 +33,14 @@ struct Weights {
     std::unordered_map<std::string, Tensor> tensors;
 
     // Reads every float tensor in the file and adds it to `tensors`.
+    // With keep_bf16, tensors whose element count is at least bf16_min_numel
+    // are stored as BF16 (converted from F16/F32 if needed) instead of F32;
+    // small tensors such as norms and biases stay F32.
     // Throws std::runtime_error on I/O errors or a malformed file.
-    void load_safetensors(const std::string& path);
+    void load_safetensors(const std::string& path, bool keep_bf16 = false, int64_t bf16_min_numel = 1 << 20);
+    // Loads <dir>/<base>.safetensors, or every shard named in
+    // <dir>/<base>.safetensors.index.json, or the .fp16 variant.
+    void load_model(const std::string& dir, const std::string& base, bool keep_bf16 = false);
 
     // Returns the tensor called `name`; throws "missing weight: name" if absent.
     const Tensor& get(const std::string& name) const;

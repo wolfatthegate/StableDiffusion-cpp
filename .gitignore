@@ -4,6 +4,10 @@ sd
 sd-server
 test_ops
 test_tokenizer
+test_qwen_tokenizer
+test_qwen3
+test_vae
+test_zimage
 *.png
 .DS_Store
 !examples/*.png
@@ -12,3 +16,5 @@ finetune/**/__pycache__/
 runs/
 data/
 finetune/*.egg-info/
+tests/fixtures/ref_*
+tests/fixtures/cpp_trace_*

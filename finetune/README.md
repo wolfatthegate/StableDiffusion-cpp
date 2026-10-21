@@ -1,4 +1,4 @@
-# sdft: configurable fine-tuning for Stable Diffusion 1.x
+# sdft: configurable fine-tuning for Z-Image and Stable Diffusion 1.x
 
 A small PyTorch training framework that lives beside the C++ inference code.
 One YAML file says which weights to train, how, and on what; the result is
@@ -36,6 +36,35 @@ sdft train   finetune/configs/smoke.yaml                            # 6 LoRA ste
 The first run fetches the small `config.json` files that `diffusers` needs
 beside the weights, since `scripts/download_sd15.sh` only fetches the
 weights.
+
+## Z-Image
+
+Z-Image is the 6B transformer model the C++ binary runs by default. The
+framework detects it from `model_index.json` (or `model.family: z-image`)
+and switches to the flow-matching objective, the Qwen3 text encoder with
+the chat template, and the FLUX VAE. Points to know:
+
+- Train on the non-distilled base, `Tongyi-MAI/Z-Image`, downloaded with
+  `ZIMAGE_REPO=Tongyi-MAI/Z-Image scripts/download_zimage.sh models/z-image`.
+  The Turbo checkpoint is distilled for 8 steps and adapts poorly.
+- `model.weights_dtype` defaults to `bf16` for Z-Image: the frozen 6B base
+  takes 12 GB and the adapters are float32. Full fine-tuning needs
+  `weights_dtype: fp32`, which is 25 GB of weights before gradients, so it
+  is a multi-GPU job; LoRA is the practical choice.
+- `weights.unet` means the generator, here the transformer. The default
+  LoRA targets `to_q, to_k, to_v, to_out.0` match its attention; add
+  `w1, w2, w3` for the feed-forward layers. `include: ["^layers\\."]`
+  restricts training to the 30 main blocks.
+- Timesteps are drawn logit-normally and shifted like the sampler
+  (`shift: 3`), and the loss is the mean squared error against `x0 - noise`.
+  `snr_gamma` does not apply.
+- The export writes the merged transformer in bf16 and links the unchanged
+  text encoder, tokenizer, VAE and scheduler to the base directory, so a
+  fine-tune costs 12 GB rather than 33.
+
+`configs/zimage_lora.yaml` is a starting point; `configs/zimage_smoke.yaml`
+runs a two-block LoRA for four steps at 256 px as a check, which takes about
+two minutes on an M1 Max.
 
 ## Preparing a dataset
 
