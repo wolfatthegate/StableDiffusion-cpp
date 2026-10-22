@@ -114,9 +114,13 @@
   #thumbs { display: flex; gap: 8px; overflow-x: auto; padding-bottom: 4px; }
   #thumbs:empty::after { content: "Finished images appear here."; color: var(--muted); font-size: 12.5px; }
   .thumb { flex: 0 0 auto; width: 88px; height: 88px; border-radius: 9px; overflow: hidden; border: 2px solid transparent; cursor: pointer;
-    background: #0a0d12; transition: border-color .15s, transform .15s; }
+    background: #0a0d12; transition: border-color .15s, transform .15s; position: relative; }
   .thumb:hover { transform: translateY(-2px); } .thumb.active { border-color: var(--accent); }
   .thumb img { width: 100%; height: 100%; object-fit: cover; display: block; }
+  .thumb .del { position: absolute; top: 4px; right: 4px; width: 22px; height: 22px; border-radius: 50%; border: none; cursor: pointer;
+    background: rgba(14,17,22,.8); color: #ffb3ad; font-size: 14px; line-height: 22px; text-align: center; padding: 0; opacity: 0; transition: opacity .15s; }
+  .thumb:hover .del { opacity: 1; } .thumb .del:hover { background: #5b2a2a; color: #fff; }
+  .thumb.removing { opacity: 0; transform: scale(.8); transition: opacity .25s, transform .25s; }
   code { background: var(--panel-2); padding: 1px 5px; border-radius: 5px; font-size: 12px; }
 </style>
 </head>
@@ -205,6 +209,7 @@
       <span>time <b id="result-time"></b></span>
       <a class="btn" id="download" download="image.png" href="#">Download</a>
       <button class="btn" id="reuse" type="button">Reuse settings</button>
+      <button class="btn danger" id="delete" type="button" title="Remove this image from the server">Delete</button>
     </div>
     <div id="error"></div>
     <div class="panel" id="history"><h2>This session</h2><div id="thumbs"></div></div>
@@ -381,14 +386,37 @@
     $('result-prompt').textContent = j.prompt || '';
     $('result-seed').textContent = j.seed; $('result-time').textContent = (j.seconds || 0).toFixed(1) + 's';
     $('download').href = j.image; $('download').download = `sd-${j.seed}.png`;
+    $('delete').dataset.id = j.id;
     $('reuse').onclick = () => {
       els.prompt.value = j.prompt || ''; els.negative.value = j.negative || ''; els.steps.value = j.steps; els.cfg.value = j.cfg;
       els.sampler.value = j.sampler; els.seed.value = j.seed;
       const sz = `${j.width}x${j.height}`; if ([...els.size.options].some(o => o.value === sz)) els.size.value = sz;
       syncLabels(); saveForm(); els.prompt.focus();
     };
+    $('delete').onclick = () => deleteJob(j.id);
     els.result.classList.add('on');
     for (const t of els.thumbs.children) t.classList.toggle('active', t.dataset.id === j.id);
+  }
+
+  // Removes a finished image from the server, the strip and the stage.
+  async function deleteJob(id) {
+    const t = [...els.thumbs.children].find(x => x.dataset.id === id);
+    if (!confirm('Delete this image? It cannot be recovered unless you downloaded it.')) return;
+    try {
+      const r = await fetch(`/api/jobs/${id}`, { method: 'DELETE' });
+      if (!r.ok) throw new Error((await r.json()).error || r.statusText);
+    } catch (err) { showError(err.message); return; }
+    jobs.delete(id);
+    if (t) { t.classList.add('removing'); setTimeout(() => t.remove(), 250); }
+    const shownId = $('delete').dataset.id;
+    if (shownId === id) {
+      els.result.classList.remove('on');
+      els.final.style.opacity = 0; els.final.removeAttribute('src');
+      els.placeholder.style.display = '';
+      // Fall back to the newest remaining image, if any.
+      const next = [...els.thumbs.children].find(x => x.dataset.id !== id);
+      if (next) setTimeout(() => next.click(), 260);
+    }
   }
 
   // ---- history ----------------------------------------------------------------
@@ -397,7 +425,8 @@
     jobs.set(j.id, j);
     const t = document.createElement('div');
     t.className = 'thumb'; t.dataset.id = j.id; t.title = `${j.prompt}\nseed ${j.seed} · ${j.steps} steps · cfg ${j.cfg}`;
-    t.innerHTML = `<img src="${j.image}" alt="">`;
+    t.innerHTML = `<img src="${j.image}" alt=""><button class="del" type="button" title="Delete">&times;</button>`;
+    t.querySelector('.del').onclick = e => { e.stopPropagation(); deleteJob(j.id); };
     t.onclick = () => {
       if (current && current.source) return;
       resetStage(); endStage(); setAspect(j.width, j.height);

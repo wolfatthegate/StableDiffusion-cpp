@@ -219,7 +219,8 @@ While an image is being generated it shows:
   per-step times, and a cancel button that stops after the current step.
 
 Finished images appear in a strip with their settings; one click reloads
-them into the form. The seed used for a random-seed run is shown so an image
+them into the form, and a Delete button (or the cross on a thumbnail)
+removes an image from the server after a confirmation. The seed used for a random-seed run is shown so an image
 can be reproduced. Form values persist in the browser. Reloading the page
 re-attaches to a generation already in progress.
 
@@ -240,6 +241,7 @@ curl -X POST localhost:8080/api/generate -H 'Content-Type: application/json' \
      -d '{"prompt":"a red fox in snow","steps":20,"seed":-1}'        # -> {"id":"..."}
 curl -N localhost:8080/api/jobs/<id>/events                           # progress stream
 curl -o fox.png localhost:8080/api/jobs/<id>/image.png
+curl -X DELETE localhost:8080/api/jobs/<id>                           # forget a finished job and its image
 ```
 
 ## Fine-tuning

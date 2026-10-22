@@ -11,6 +11,7 @@
 //   GET  /api/jobs/<id>            snapshot of one job
 //   GET  /api/jobs/<id>/events     SSE stream: queued, started, phase, step, done, error, cancelled
 //   POST /api/jobs/<id>/cancel     stops after the current step
+//   DELETE /api/jobs/<id>          forgets a finished (or cancelled/failed) job and its image
 //   GET  /api/jobs/<id>/image.png  the finished image
 // ============================================================================
 #include <algorithm>
@@ -126,6 +127,20 @@ public:
     std::string current() {
         std::lock_guard<std::mutex> lk(m_);
         return busy_ ? current_ : "";
+    }
+    // Drops a finished job and frees its image. Returns false if the job is
+    // unknown, or still queued or running (cancel it first).
+    bool remove(const std::string& id) {
+        std::lock_guard<std::mutex> lk(m_);
+        auto it = jobs_.find(id);
+        if (it == jobs_.end()) return false;
+        {
+            std::lock_guard<std::mutex> jl(it->second->m);
+            if (!it->second->finished) return false;
+        }
+        jobs_.erase(it);
+        order_.erase(std::remove(order_.begin(), order_.end(), id), order_.end());
+        return true;
     }
 
 private:
@@ -429,6 +444,11 @@ int main(int argc, char** argv) try {
         }
         if (action.empty() && req.method == "GET") {
             c.send_json(200, job_json(*job));
+        } else if (action.empty() && req.method == "DELETE") {
+            if (queue.remove(id))
+                c.send_json(200, "{\"ok\":true}");
+            else
+                c.send_json(409, "{\"error\":\"job is still running; cancel it first\"}");
         } else if (action == "cancel" && req.method == "POST") {
             job->cancel = true;
             c.send_json(200, "{\"ok\":true}");
@@ -471,6 +491,7 @@ int main(int argc, char** argv) try {
     };
     server.route("GET", "/api/jobs/*", job_route);
     server.route("POST", "/api/jobs/*", job_route);
+    server.route("DELETE", "/api/jobs/*", job_route);
 
     std::fprintf(stderr, "listening on http://%s:%d/\n", opt.host.c_str(), server.port());
     server.run();
