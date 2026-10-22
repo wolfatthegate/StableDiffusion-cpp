@@ -39,11 +39,43 @@ def export_model(cfg: Config, comps: Components, setup: TrainSetup) -> str:
             print("warning: export.fuse_lora is false, so the exported model equals the base model; "
                   "the C++ binary cannot apply lora.safetensors on its own")
 
-    save_pipeline(comps, out, torch.float16 if e.dtype == "fp16" else torch.float32)
-    ensure_tokenizer_files(cfg.model.base, comps.tokenizer, out)
+    if comps.family == "z-image":
+        save_zimage(cfg, comps, out)
+    else:
+        save_pipeline(comps, out, torch.float16 if e.dtype == "fp16" else torch.float32)
+        ensure_tokenizer_files(cfg.model.base, comps.tokenizer, out)
     dump_config(cfg, os.path.join(out, "training_config.yaml"))
-    verify_export(out)
+    verify_export(out, comps.family)
     return out
+
+
+def _link_or_copy(src: str, dst: str) -> None:
+    """Shares large unchanged files with the base directory via a relative
+    symlink, copying when links are unavailable."""
+    if os.path.exists(dst):
+        return
+    os.makedirs(os.path.dirname(dst), exist_ok=True)
+    try:
+        os.symlink(os.path.relpath(os.path.abspath(src), os.path.dirname(os.path.abspath(dst))), dst)
+    except OSError:
+        shutil.copyfile(src, dst)
+
+
+def save_zimage(cfg: Config, comps: Components, out: str) -> None:
+    """Writes the trained transformer in bf16 and shares the untouched text
+    encoder, tokenizer, VAE and scheduler with the base directory."""
+    base = cfg.model.base
+    comps.unet.to(torch.bfloat16).save_pretrained(os.path.join(out, "transformer"), safe_serialization=True)
+    for sub in ("text_encoder", "tokenizer", "vae", "scheduler"):
+        src_dir = os.path.join(base, sub)
+        if not os.path.isdir(src_dir):
+            continue
+        for name in os.listdir(src_dir):
+            _link_or_copy(os.path.join(src_dir, name), os.path.join(out, sub, name))
+    index = os.path.join(base, "model_index.json")
+    if os.path.exists(index):
+        shutil.copyfile(index, os.path.join(out, "model_index.json"))
+    print(f"wrote transformer to {out}/transformer; other components link to {base}")
 
 
 def ensure_tokenizer_files(base: str, tokenizer, out: str) -> None:
@@ -92,10 +124,18 @@ def save_pipeline(comps: Components, out: str, dtype: torch.dtype) -> None:
         dlog.set_verbosity(verbosity)
 
 
-def verify_export(out: str) -> None:
+def verify_export(out: str, family: str = "sd1") -> None:
     """Checks the files `./sd` needs and prints their sizes."""
-    needed = ["tokenizer/vocab.json", "tokenizer/merges.txt", "text_encoder/model.safetensors",
-              "unet/diffusion_pytorch_model.safetensors", "vae/diffusion_pytorch_model.safetensors"]
+    if family == "z-image":
+        needed = ["model_index.json", "tokenizer/vocab.json", "tokenizer/merges.txt", "tokenizer/tokenizer_config.json",
+                  "text_encoder/model.safetensors.index.json", "transformer/config.json", "vae/diffusion_pytorch_model.safetensors",
+                  "scheduler/scheduler_config.json"]
+        tr = os.path.join(out, "transformer")
+        if os.path.isdir(tr) and not any(f.startswith("diffusion_pytorch_model") and f.endswith(".safetensors") for f in os.listdir(tr)):
+            needed.append("transformer/diffusion_pytorch_model.safetensors")
+    else:
+        needed = ["tokenizer/vocab.json", "tokenizer/merges.txt", "text_encoder/model.safetensors",
+                  "unet/diffusion_pytorch_model.safetensors", "vae/diffusion_pytorch_model.safetensors"]
     ok = True
     for rel in needed:
         p = os.path.join(out, rel)

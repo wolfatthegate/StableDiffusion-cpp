@@ -9,8 +9,11 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
+#include <fstream>
+#include <iterator>
 #include <stdexcept>
 
 #include "json.h"
@@ -49,13 +52,6 @@ float f16_to_f32(uint16_t h) {
     return f;
 }
 
-// bfloat16 is the top 16 bits of a float32, so conversion is a shift.
-float bf16_to_f32(uint16_t h) {
-    uint32_t bits = (uint32_t)h << 16;
-    float f;
-    std::memcpy(&f, &bits, 4);
-    return f;
-}
 
 // RAII read-only memory map of a whole file. The OS pages data in on
 // demand, so a 1.7 GB file costs no up-front read.
@@ -82,7 +78,7 @@ struct MappedFile {
 
 }  // namespace
 
-void Weights::load_safetensors(const std::string& path) {
+void Weights::load_safetensors(const std::string& path, bool keep_bf16, int64_t bf16_min_numel) {
     // 1. Map the file and parse the JSON header that follows the 8-byte length.
     MappedFile f(path);
     if (f.size < 8) throw std::runtime_error("safetensors: file too small: " + path);
@@ -119,7 +115,13 @@ void Weights::load_safetensors(const std::string& path) {
         }
         Tensor& t = tensors[names[i]];
         t.shape = shape;
-        t.data.resize((size_t)Tensor::numel_of(shape));
+        const int64_t n = Tensor::numel_of(shape);
+        if (keep_bf16 && n >= bf16_min_numel) {
+            t.dtype = DType::BF16;
+            t.data16.resize((size_t)n);
+        } else {
+            t.data.resize((size_t)n);
+        }
         slots[i] = &t;
         dtypes[i] = dtype;
         ranges[i] = {b, e};
@@ -129,8 +131,28 @@ void Weights::load_safetensors(const std::string& path) {
         Tensor* t = slots[i];
         if (!t) return;
         const uint8_t* src = data + ranges[i].first;
-        const size_t n = t->data.size();
+        const size_t n = (size_t)t->numel();
         const size_t bytes = ranges[i].second - ranges[i].first;
+        if (t->is_bf16()) {
+            const size_t elem = dtypes[i] == "F32" ? 4 : 2;
+            if (bytes != n * elem) throw std::runtime_error("safetensors: size mismatch for " + names[i]);
+            if (dtypes[i] == "BF16") {
+                std::memcpy(t->data16.data(), src, bytes);
+            } else if (dtypes[i] == "F16") {
+                for (size_t j = 0; j < n; ++j) {
+                    uint16_t h;
+                    std::memcpy(&h, src + 2 * j, 2);
+                    t->data16[j] = f32_to_bf16(f16_to_f32(h));
+                }
+            } else {
+                for (size_t j = 0; j < n; ++j) {
+                    float f;
+                    std::memcpy(&f, src + 4 * j, 4);
+                    t->data16[j] = f32_to_bf16(f);
+                }
+            }
+            return;
+        }
         if (dtypes[i] == "F32") {
             if (bytes != n * 4) throw std::runtime_error("safetensors: size mismatch for " + names[i]);
             std::memcpy(t->data.data(), src, bytes);
@@ -144,6 +166,30 @@ void Weights::load_safetensors(const std::string& path) {
             }
         }
     });
+}
+
+void Weights::load_model(const std::string& dir, const std::string& base, bool keep_bf16) {
+    struct stat st;
+    auto exists = [&](const std::string& p) { return stat(p.c_str(), &st) == 0; };
+    const std::string single = dir + "/" + base + ".safetensors";
+    const std::string fp16 = dir + "/" + base + ".fp16.safetensors";
+    const std::string index = dir + "/" + base + ".safetensors.index.json";
+    if (exists(single)) {
+        load_safetensors(single, keep_bf16);
+    } else if (exists(index)) {
+        std::ifstream in(index);
+        std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+        Json j = parse_json(text);
+        std::vector<std::string> shards;
+        for (const auto& kv : j.at("weight_map").obj)
+            if (std::find(shards.begin(), shards.end(), kv.second.str) == shards.end()) shards.push_back(kv.second.str);
+        std::sort(shards.begin(), shards.end());
+        for (const auto& s : shards) load_safetensors(dir + "/" + s, keep_bf16);
+    } else if (exists(fp16)) {
+        load_safetensors(fp16, keep_bf16);
+    } else {
+        throw std::runtime_error("cannot find " + single + " (or a .fp16 / sharded .index.json variant)");
+    }
 }
 
 const Tensor& Weights::get(const std::string& name) const {

@@ -12,9 +12,10 @@ namespace {
 constexpr float kEps = 1e-6f;  // every GroupNorm in the VAE uses 1e-6
 }
 
-VAEDecoder::VAEDecoder(const Weights& w)
-    : post_quant_(w, "post_quant_conv"), conv_in_(w, "decoder.conv_in"), conv_out_(w, "decoder.conv_out"),
-      norm_out_(w, "decoder.conv_norm_out", kEps) {
+VAEDecoder::VAEDecoder(const Weights& w, float scaling_factor, float shift_factor)
+    : conv_in_(w, "decoder.conv_in"), conv_out_(w, "decoder.conv_out"), norm_out_(w, "decoder.conv_norm_out", kEps),
+      scaling_factor_(scaling_factor), shift_factor_(shift_factor) {
+    if (w.has("post_quant_conv.weight")) post_quant_ = Conv2d(w, "post_quant_conv");
     mid_res0_.reset(new ResnetBlock(w, "decoder.mid_block.resnets.0", kEps));
     mid_res1_.reset(new ResnetBlock(w, "decoder.mid_block.resnets.1", kEps));
     mid_attn_.reset(new VAEAttention(w, "decoder.mid_block.attentions.0"));
@@ -32,10 +33,10 @@ VAEDecoder::VAEDecoder(const Weights& w)
 }
 
 Tensor VAEDecoder::decode(const Tensor& latents) const {
-    // Undo the training-time latent scaling.
+    // Undo the training-time latent scaling: z / scale + shift.
     Tensor z = latents;
-    scale_(z, 1.0f / kScalingFactor);
-    Tensor h = conv_in_(post_quant_(z));
+    for (float& v : z.data) v = v / scaling_factor_ + shift_factor_;
+    Tensor h = conv_in_(post_quant_.valid() ? post_quant_(z) : z);
     h = mid_res0_->forward(h, nullptr);
     h = mid_attn_->forward(h);
     h = mid_res1_->forward(h, nullptr);

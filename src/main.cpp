@@ -22,6 +22,9 @@ struct Options {
     std::string model_dir = "models/sd15";
     std::string output = "output.png";
     GenerateParams gen;
+    // Which fields were given on the command line; the rest take the
+    // pipeline's family defaults (SD 1.x or Z-Image).
+    bool have_steps = false, have_cfg = false, have_size = false, have_sampler = false;
     int threads = 0;
 };
 
@@ -29,12 +32,12 @@ void usage() {
     std::fprintf(stderr,
                  "usage: sd --prompt TEXT [options]\n"
                  "  --model-dir DIR       diffusers-layout model directory (default models/sd15)\n"
-                 "  --negative TEXT       negative prompt\n"
-                 "  --steps N             sampling steps (default 20)\n"
-                 "  --cfg F               classifier-free guidance scale (default 7.5; 1 disables)\n"
-                 "  --width N --height N  image size, multiples of 64 (default 512x512)\n"
+                 "  --negative TEXT       negative prompt (needs --cfg > 0)\n"
+                 "  --steps N             sampling steps (SD 1.x default 20; Z-Image 9)\n"
+                 "  --cfg F               guidance scale (SD 1.x default 7.5; Z-Image Turbo 0 = off)\n"
+                 "  --width N --height N  image size, multiples of 64 (SD 1.x 512; Z-Image 1024)\n"
                  "  --seed N              RNG seed (default 42; -1 picks a random seed)\n"
-                 "  --sampler NAME        euler | ddim (default euler)\n"
+                 "  --sampler NAME        euler | ddim for SD 1.x, flow for Z-Image\n"
                  "  --threads N           worker threads (default: all cores)\n"
                  "  --output FILE         PNG path (default output.png)\n");
 }
@@ -55,12 +58,12 @@ Options parse_args(int argc, char** argv) {
         if (a == "--prompt" || a == "-p") o.gen.prompt = need("--prompt");
         else if (a == "--negative" || a == "--negative-prompt" || a == "-n") o.gen.negative = need("--negative");
         else if (a == "--model-dir" || a == "-m") o.model_dir = need("--model-dir");
-        else if (a == "--steps") o.gen.steps = std::atoi(need("--steps").c_str());
-        else if (a == "--cfg") o.gen.cfg = (float)std::atof(need("--cfg").c_str());
-        else if (a == "--width" || a == "-W") o.gen.width = std::atoi(need("--width").c_str());
-        else if (a == "--height" || a == "-H") o.gen.height = std::atoi(need("--height").c_str());
+        else if (a == "--steps") { o.gen.steps = std::atoi(need("--steps").c_str()); o.have_steps = true; }
+        else if (a == "--cfg") { o.gen.cfg = (float)std::atof(need("--cfg").c_str()); o.have_cfg = true; }
+        else if (a == "--width" || a == "-W") { o.gen.width = std::atoi(need("--width").c_str()); o.have_size = true; }
+        else if (a == "--height" || a == "-H") { o.gen.height = std::atoi(need("--height").c_str()); o.have_size = true; }
         else if (a == "--seed" || a == "-s") o.gen.seed = std::strtoll(need("--seed").c_str(), nullptr, 10);
-        else if (a == "--sampler") o.gen.sampler = need("--sampler");
+        else if (a == "--sampler") { o.gen.sampler = need("--sampler"); o.have_sampler = true; }
         else if (a == "--threads" || a == "-t") o.threads = std::atoi(need("--threads").c_str());
         else if (a == "--output" || a == "-o") o.output = need("--output");
         else if (a == "--help" || a == "-h") {
@@ -93,7 +96,15 @@ int main(int argc, char** argv) try {
 
     double t0 = now();
     Pipeline pipe(opt.model_dir);
-    std::fprintf(stderr, "models loaded in %.1fs (unet: %.2fM params)\n", now() - t0, pipe.unet_params() / 1e6);
+    std::fprintf(stderr, "%s models loaded in %.1fs (generator: %.0fM params)\n", pipe.family_name(), now() - t0,
+                 pipe.generator_params() / 1e6);
+    GenerateParams d = pipe.defaults();
+    if (!opt.have_steps) opt.gen.steps = d.steps;
+    if (!opt.have_cfg) opt.gen.cfg = d.cfg;
+    if (!opt.have_size) { opt.gen.width = d.width; opt.gen.height = d.height; }
+    if (!opt.have_sampler) opt.gen.sampler = d.sampler;
+    std::fprintf(stderr, "%dx%d, %d steps, sampler %s, cfg %g\n", opt.gen.width, opt.gen.height, opt.gen.steps,
+                 opt.gen.sampler.c_str(), opt.gen.cfg);
 
     GenerateResult r = pipe.generate(opt.gen, [&](const Progress& pr) {
         if (pr.phase == Progress::Denoising)

@@ -95,7 +95,30 @@ private:
     int step_ratio_ = 50;  // 1000 / steps (integer division)
 };
 
-// Factory: "euler" or "ddim". Throws std::runtime_error for anything else.
+// Flow matching with Euler steps (diffusers FlowMatchEulerDiscreteScheduler
+// as configured for Z-Image: static shift, no dynamic shifting).
+//     sigmas = linspace(1, 1/N, N), then sigma <- shift*sigma / (1 + (shift-1)*sigma), then 0
+//     x_t = (1 - sigma) x0 + sigma noise
+// The model receives t = 1 - sigma (and multiplies by 1000 itself) and
+// returns out = x0 - noise, so one step is x += (sigma - sigma_next) * out
+// and the clean estimate is x0 = x + sigma * out. The initial latent is pure
+// noise (sigma = 1), so init_noise_sigma() is 1.
+class FlowMatchScheduler : public Scheduler {
+public:
+    explicit FlowMatchScheduler(float shift = 3.0f) : shift_(shift) {}
+    void set_timesteps(int steps) override;
+    // Model-facing time for step i: 1 - sigma_i.
+    float model_time(int step) const { return 1.0f - sigmas_[step]; }
+    float sigma(int step) const { return sigmas_[step]; }
+    void step(const Tensor& out, int step, Tensor& x) const override;
+    Tensor predict_x0(const Tensor& x, const Tensor& out, int step) const override;
+
+private:
+    float shift_;
+    std::vector<float> sigmas_;  // steps + 1 entries, last is 0
+};
+
+// Factory: "euler", "ddim" or "flow". Throws std::runtime_error for anything else.
 std::unique_ptr<Scheduler> make_scheduler(const std::string& name);
 
 }  // namespace sd

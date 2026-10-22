@@ -53,27 +53,60 @@ class Components:
     tokenizer: object
     text_encoder: nn.Module
     vae: nn.Module
-    unet: nn.Module
+    unet: nn.Module          # the image generator: UNet (sd1) or S3-DiT transformer (z-image)
     noise_scheduler: object
     variant: Optional[str] = None
+    family: str = "sd1"
+    weights_dtype: torch.dtype = torch.float32
+
+
+def detect_family(base: str, requested: str) -> str:
+    if requested != "auto":
+        return requested
+    index = os.path.join(base, "model_index.json")
+    if os.path.isdir(base) and os.path.exists(index):
+        import json
+        with open(index) as f:
+            cls = json.load(f).get("_class_name", "")
+        return "z-image" if "ZImage" in cls else "sd1"
+    if os.path.isdir(base) and os.path.exists(os.path.join(base, "transformer", "config.json")):
+        return "z-image"
+    return "z-image" if "z-image" in base.lower() else "sd1"
 
 
 def load_components(cfg: Config) -> Components:
-    from diffusers import AutoencoderKL, DDPMScheduler, UNet2DConditionModel
-    from transformers import CLIPTextModel, CLIPTokenizer
+    from diffusers import AutoencoderKL
 
     base = cfg.model.base
+    family = detect_family(base, cfg.model.family)
+    dtype_name = cfg.model.weights_dtype if cfg.model.weights_dtype != "auto" else ("bf16" if family == "z-image" else "fp32")
+    wdtype = torch.bfloat16 if dtype_name == "bf16" else torch.float32
+
+    if family == "z-image":
+        from diffusers import FlowMatchEulerDiscreteScheduler, ZImageTransformer2DModel
+        from transformers import AutoTokenizer, Qwen3Model
+        tokenizer = AutoTokenizer.from_pretrained(base, subfolder="tokenizer")
+        text_encoder = Qwen3Model.from_pretrained(base, subfolder="text_encoder", dtype=wdtype)
+        vae = AutoencoderKL.from_pretrained(base, subfolder="vae", torch_dtype=torch.float32)
+        generator = ZImageTransformer2DModel.from_pretrained(base, subfolder="transformer", torch_dtype=wdtype)
+        noise_scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(base, subfolder="scheduler")
+        for m in (text_encoder, vae, generator):
+            m.requires_grad_(False)
+        return Components(tokenizer, text_encoder, vae, generator, noise_scheduler, None, "z-image", wdtype)
+
+    from diffusers import DDPMScheduler, UNet2DConditionModel
+    from transformers import CLIPTextModel, CLIPTokenizer
     ensure_configs(base, cfg.model.config_repo)
     variant = detect_variant(base, cfg.model.variant)
     kw = {"variant": variant} if variant else {}
     tokenizer = CLIPTokenizer.from_pretrained(base, subfolder="tokenizer")
-    text_encoder = CLIPTextModel.from_pretrained(base, subfolder="text_encoder", **kw).to(torch.float32)
+    text_encoder = CLIPTextModel.from_pretrained(base, subfolder="text_encoder", **kw).to(wdtype)
     vae = AutoencoderKL.from_pretrained(base, subfolder="vae", **kw).to(torch.float32)
-    unet = UNet2DConditionModel.from_pretrained(base, subfolder="unet", **kw).to(torch.float32)
+    unet = UNet2DConditionModel.from_pretrained(base, subfolder="unet", **kw).to(wdtype)
     noise_scheduler = DDPMScheduler.from_pretrained(base, subfolder="scheduler")
     for m in (text_encoder, vae, unet):
         m.requires_grad_(False)
-    return Components(tokenizer, text_encoder, vae, unet, noise_scheduler, variant)
+    return Components(tokenizer, text_encoder, vae, unet, noise_scheduler, variant, "sd1", wdtype)
 
 
 # ----------------------------------------------------------------------------
@@ -141,6 +174,9 @@ def apply_weights_config(cfg: Config, comps: Components) -> TrainSetup:
             names, params = [], []
             for name, p in module.named_parameters():
                 if _passes(name, cw):
+                    if p.dtype != torch.float32:
+                        raise ValueError(f"weights.{comp_name}: full fine-tuning needs model.weights_dtype: fp32 "
+                                         f"(parameter {name} is {p.dtype})")
                     p.requires_grad_(True)
                     names.append(name)
                     params.append(p)

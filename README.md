@@ -1,20 +1,33 @@
 # StableDiffusion-cpp
 
-Stable Diffusion 1.x text-to-image inference written from scratch in C++17.
+Text-to-image inference written from scratch in C++17, running two model
+families on the CPU:
 
-There are no third-party dependencies. PyTorch, BLAS, ONNX, image libraries and
-JSON libraries are all absent. Every piece of the pipeline is implemented in
-`src/` in about 2,500 lines:
+- **Z-Image** (`Tongyi-MAI/Z-Image-Turbo`, Apache 2.0): a 6B single-stream
+  diffusion transformer with a Qwen3-4B text encoder and the FLUX VAE, among
+  the strongest open-weight image models. 8 steps, no negative prompt needed.
+  This is the recommended model.
+- **Stable Diffusion 1.x**: the original 860M UNet model, kept for its speed
+  and small size.
 
-- the numeric kernels: GEMM, convolution, attention, normalisation
-- the safetensors weight loader and a JSON parser
-- the CLIP byte-level BPE tokenizer
-- the CLIP text encoder, the UNet and the VAE decoder
-- the Euler and DDIM samplers
+There are no third-party dependencies in the default build. PyTorch, ONNX,
+image libraries and JSON libraries are all absent. Every piece of the
+pipeline is implemented in `src/`:
+
+- the numeric kernels: GEMM (float32 and bf16 weights), convolution,
+  attention with grouped query heads, RMS / layer / group normalisation,
+  rotary embeddings, SwiGLU
+- the safetensors loader (single and sharded files) and a JSON parser
+- the CLIP and Qwen byte-level BPE tokenizers
+- the CLIP and Qwen3-4B text encoders, the SD UNet, the Z-Image transformer
+  and the VAE decoder
+- Euler, DDIM and flow-matching samplers
 - a PNG writer
 
-It runs on the CPU in float32 and reads the standard Hugging Face diffusers
-weight layout, so any SD 1.x checkpoint in that format works.
+On macOS the GEMM goes through Apple's Accelerate framework by default
+(`make ACCELERATE=0` keeps everything hand-written); every other platform
+uses the built-in kernel. Weights are read in the standard Hugging Face
+diffusers layout, so fine-tunes of either family load unchanged.
 
 Beside the command-line tool there is a **web interface** (`./sd-server`,
 also dependency-free) that shows the image emerging step by step while it is
@@ -22,9 +35,11 @@ generated, and a **Python fine-tuning framework** (`finetune/`) whose YAML
 config decides which weights to train and that exports models the C++ code
 loads directly.
 
-| `--prompt "a photo of an astronaut riding a horse on mars, highly detailed"` <br> `--negative "blurry, low quality, deformed" --steps 20 --seed 42` | `--prompt "a watercolor painting of a lighthouse at sunset"` <br> `--sampler ddim --steps 15 --seed 7` |
+| Z-Image-Turbo, 1024x1024, 9 steps, 6 minutes on an M1 Max | SD 1.5, 512x512, 20 steps, 95 seconds |
 |---|---|
-| ![astronaut](examples/astronaut.png) | ![lighthouse](examples/lighthouse.png) |
+| ![z-image astronaut](examples/zimage-astronaut.png) | ![sd 1.5 astronaut](examples/astronaut.png) |
+
+Both from `--prompt "a photo of an astronaut riding a horse on mars, highly detailed" --seed 42`.
 
 ## Contents
 
@@ -51,14 +66,19 @@ map of where to change the code for speed or quality, see
 ## Quick start
 
 ```sh
-make -j                          # build ./sd and ./sd-server
-scripts/download_sd15.sh         # fetch SD 1.5 weights (~2.1 GB) into models/sd15
-./sd --prompt "a photo of a cat" --output cat.png
-./sd-server                      # then open http://127.0.0.1:8080/
+make -j                                   # build ./sd and ./sd-server
+scripts/download_zimage.sh                # Z-Image-Turbo, 33 GB, into models/z-image-turbo
+./sd --model-dir models/z-image-turbo --prompt "a photo of a cat" --output cat.png
+./sd-server --model-dir models/z-image-turbo    # then open http://127.0.0.1:8080/
 ```
 
-A 512x512 image with the default 20 steps takes about 95 seconds on a 10-core
-Apple Silicon machine.
+Z-Image needs about 25 GB of memory. On a 10-core M1 Max a 1024x1024 image
+takes about 6 minutes and a 512x512 one 85 seconds. For a smaller model:
+
+```sh
+scripts/download_sd15.sh                  # SD 1.5, 2.1 GB, into models/sd15
+./sd --model-dir models/sd15 --prompt "a photo of a cat"   # 95 s at 512x512, 6 GB
+```
 
 ## Building
 
@@ -83,7 +103,7 @@ Build options:
 
 | option | effect |
 |---|---|
-| `make ACCELERATE=1` | macOS only. Routes `gemm_nt` to Apple's Accelerate BLAS instead of the built-in kernel. Nothing else changes. |
+| `make ACCELERATE=0` | macOS: use the built-in GEMM instead of Apple's Accelerate BLAS (the default on macOS, 2.6x faster for Z-Image). Elsewhere the built-in kernel is always used. |
 | `CXX=g++ make` | use a different compiler |
 | `CXXFLAGS="..." make` | replace the default `-std=c++17 -O3 -Wall -Wextra -pthread` |
 
@@ -92,11 +112,24 @@ FMA. On arm64, NEON is used automatically.
 
 ## Model weights
 
-`scripts/download_sd15.sh [dir]` downloads Stable Diffusion 1.5 from the
-`stable-diffusion-v1-5/stable-diffusion-v1-5` repository on Hugging Face into
-`models/sd15` by default. It fetches the fp16 safetensors files, which are
-half the size of the fp32 ones, and converts nothing on disk. Downloads resume
-if interrupted. Set `HF_TOKEN` if the repository ever requires a login.
+| model | script | size on disk | memory in use | licence |
+|---|---|---|---|---|
+| Z-Image-Turbo | `scripts/download_zimage.sh [dir]` | 33 GB (fp32 transformer + bf16 text encoder, as published) | about 25 GB | Apache 2.0 |
+| Stable Diffusion 1.5 | `scripts/download_sd15.sh [dir]` | 2.1 GB (fp16) | about 6 GB | CreativeML OpenRAIL-M |
+
+Both scripts download from Hugging Face with `curl`, resume if interrupted,
+and accept `HF_TOKEN` if a repository ever requires a login. The pipeline
+reads `model_index.json` to tell the families apart.
+
+### Z-Image
+
+`models/z-image-turbo/` holds `transformer/` (3 shards, loaded as bf16),
+`text_encoder/` (Qwen3-4B, 3 shards, bf16), `vae/`, `tokenizer/` and
+`scheduler/`, plus their `config.json` files. The non-distilled
+`Tongyi-MAI/Z-Image` for fine-tuning downloads the same way with
+`ZIMAGE_REPO=Tongyi-MAI/Z-Image scripts/download_zimage.sh models/z-image`.
+
+### Stable Diffusion 1.x
 
 The model directory must look like this:
 
@@ -127,14 +160,14 @@ diffusers conversion script, because the tensor names differ.
 | flag | short | default | meaning |
 |---|---|---|---|
 | `--prompt` | `-p` | required | what to draw |
-| `--negative` | `-n` | empty | what to steer away from; also `--negative-prompt` |
+| `--negative` | `-n` | empty | what to steer away from; needs `--cfg` above 0 (SD 1.x) or above 0 (Z-Image base) |
 | `--model-dir` | `-m` | `models/sd15` | diffusers-layout model directory |
-| `--steps` | | 20 | number of sampler steps |
-| `--cfg` | | 7.5 | classifier-free guidance scale; `1` disables guidance and halves the work |
-| `--width` | `-W` | 512 | image width; multiple of 8, at least 64 |
-| `--height` | `-H` | 512 | image height; multiple of 8, at least 64 |
+| `--steps` | | 20 (SD), 9 (Z-Image) | number of sampler steps |
+| `--cfg` | | 7.5 (SD), 0 (Z-Image) | guidance scale; `0` or `1` disables it. Z-Image-Turbo is trained without guidance and must use 0 |
+| `--width` | `-W` | 512 (SD), 1024 (Z-Image) | image width; multiple of 64 |
+| `--height` | `-H` | 512 (SD), 1024 (Z-Image) | image height; multiple of 64 |
 | `--seed` | `-s` | 42 | seed for the initial noise; `-1` picks a random one and prints it |
-| `--sampler` | | `euler` | `euler` or `ddim` |
+| `--sampler` | | `euler` (SD), `flow` (Z-Image) | `euler` or `ddim` for SD 1.x; `flow` for Z-Image |
 | `--threads` | `-t` | all cores | worker threads |
 | `--output` | `-o` | `output.png` | output PNG path |
 | `--help` | `-h` | | print usage |
@@ -152,14 +185,15 @@ vae decode + save: 7.2s -> output.png
 
 Practical notes:
 
+- Z-Image's native resolution is 1024; 768 and 512 are usable for drafts
+  at a quarter and a sixteenth of the cost. Prompts may be up to 512 tokens
+  and can be long and descriptive. 8 or 9 steps are enough for the Turbo
+  model; the non-distilled base wants 30 to 50 with `--cfg 4`.
 - SD 1.x was trained at 512x512. Other sizes work, but sizes far from 512
-  tend to produce duplicated subjects or poor composition.
-- A width or height that is a multiple of 8 but not of 64 can fail with a
-  channel-concatenation error, because the UNet halves the latent three times
-  and the skip connections must line up. Use multiples of 64.
-- Prompts longer than 75 tokens are truncated.
-- 20 to 30 Euler steps, or 15 to 50 DDIM steps, give good results. Guidance
-  between 5 and 9 is typical.
+  tend to produce duplicated subjects or poor composition. Its prompts are
+  truncated at 75 tokens. 20 to 30 Euler steps, or 15 to 50 DDIM steps, give
+  good results with guidance between 5 and 9.
+- Both models need widths and heights that are multiples of 64.
 
 ## Web interface
 
@@ -189,8 +223,8 @@ them into the form. The seed used for a random-seed run is shown so an image
 can be reproduced. Form values persist in the browser. Reloading the page
 re-attaches to a generation already in progress.
 
-The server loads all three models once (about 6 GB of memory in use) and
-runs one generation at a time; further requests wait in a queue and the page shows
+The server loads all models once (about 25 GB for Z-Image, 6 GB for SD 1.x)
+and runs one generation at a time; further requests wait in a queue and the page shows
 the position. `--host 0.0.0.0` makes it reachable from other machines on
 the network. There is no authentication, so keep it on a trusted network.
 
@@ -217,10 +251,14 @@ PyTorch with the framework in [finetune/](finetune/README.md) and point
 ```sh
 pip install -e finetune
 python finetune/scripts/make_sample_dataset.py data/sample-shapes   # or use your own images + captions
-sdft inspect finetune/configs/lora.yaml                             # shows exactly which weights will train
-sdft train   finetune/configs/lora.yaml                             # LoRA on the UNet, exported to models/sd15-lora
-./sd --model-dir models/sd15-lora --prompt "..."
+sdft inspect finetune/configs/zimage_lora.yaml                      # shows exactly which weights will train
+sdft train   finetune/configs/zimage_lora.yaml                      # LoRA on the Z-Image transformer
+./sd --model-dir models/z-image-lora --prompt "..."
 ```
+
+`finetune/configs/lora.yaml` and `full.yaml` do the same for SD 1.x. For
+Z-Image, train on the non-distilled `Tongyi-MAI/Z-Image` base; the Turbo
+weights are distilled and adapt poorly.
 
 The YAML `weights` section chooses the method (LoRA adapters or full
 weights), which components train (UNet, text encoder), per-component
@@ -233,9 +271,14 @@ this project and `diffusers` can load the result.
 
 ## How Stable Diffusion works
 
-Stable Diffusion is a *latent* diffusion model. Rather than denoising pixels,
-it denoises a small 4-channel latent image 8 times smaller than the output,
-and a separate decoder turns the final latent into pixels.
+Both models are *latent* diffusion models. Rather than denoising pixels,
+they denoise a small latent image 8 times smaller than the output (4
+channels for SD, 16 for Z-Image), and a separate decoder turns the final
+latent into pixels. The text goes in through a frozen language model: CLIP
+for SD 1.x, the Qwen3-4B decoder for Z-Image. The diagram below shows the
+SD 1.x pipeline; Z-Image replaces the UNet with a transformer that attends
+jointly over image and text tokens, uses flow matching instead of a noise
+schedule, and needs no guidance pass.
 
 ```
 prompt ──> CLIPTokenizer ──> CLIPTextEncoder ──┐ context [2, 77, 768]
@@ -271,10 +314,13 @@ these levels.
 
 ```
 src/
-  pipeline.h / .cpp      Pipeline: models kept in memory, generate() with progress callback
+  pipeline.h / .cpp      Pipeline: model family detection, models kept in memory, generate()
+  zimage.h / .cpp        Z-Image single-stream diffusion transformer (S3-DiT)
+  qwen3.h / .cpp         Qwen3 decoder-only language model, used as the Z-Image text encoder
+  qwen_tokenizer.h/.cpp  Qwen byte-level BPE tokenizer with the chat template
   http.h / .cpp          minimal HTTP/1.1 server with streamed responses
   server.cpp             sd-server: JSON API, job queue, live previews
-  tensor.h / .cpp        Tensor type, thread pool, GEMM, and every operator
+  tensor.h / .cpp        Tensor type (f32 / bf16), thread pool, GEMM, and every operator
   json.h / .cpp          minimal JSON parser
   safetensors.h / .cpp   weight file loader with F16/BF16 conversion
   tokenizer.h / .cpp     CLIP byte-level BPE tokenizer
@@ -282,7 +328,7 @@ src/
   clip.h / .cpp          CLIP text encoder
   unet.h / .cpp          UNet2DConditionModel
   vae.h / .cpp           AutoencoderKL decoder
-  scheduler.h / .cpp     beta schedule, Euler and DDIM samplers
+  scheduler.h / .cpp     beta schedule, Euler and DDIM samplers; flow-matching sampler
   image.h / .cpp         PNG encoder and base64
   main.cpp               CLI on top of Pipeline
 web/
@@ -291,8 +337,11 @@ finetune/
   sdft/                  Python fine-tuning framework (see finetune/README.md)
   configs/               example configs: lora.yaml, full.yaml, smoke.yaml
 tests/
-  test_ops.cpp           kernel tests against naive references, plus a GEMM benchmark
-  test_tokenizer.cpp     tokenizer tests against known token ids
+  test_ops.cpp           kernel tests against naive references, plus GEMM benchmarks
+  test_tokenizer.cpp     CLIP tokenizer tests against known token ids
+  test_qwen_tokenizer.cpp  Qwen tokenizer against fixtures from the Hugging Face tokenizer
+  test_qwen3.cpp, test_vae.cpp, test_zimage.cpp   each model against a PyTorch reference dump
+  fixtures/              tokenizer fixtures; reference dumps are generated locally
 scripts/
   download_sd15.sh       weight downloader
 examples/                sample outputs shown above
@@ -505,6 +554,28 @@ x0     = (x_t - sqrt(1 - a_t) * eps) / sqrt(a_t)
 x_prev = sqrt(a_prev) * x0 + sqrt(1 - a_prev) * eps
 ```
 
+### Z-Image (`src/zimage.h`, `src/qwen3.h`, `src/qwen_tokenizer.h`)
+
+The Qwen tokenizer wraps the prompt in the chat template
+(`<|im_start|>user ... <|im_end|> <|im_start|>assistant`) and tokenises it
+with Qwen's byte-level BPE and pre-tokenisation rules. The Qwen3-4B decoder
+(36 layers, grouped-query attention with 32 query and 8 key-value heads,
+rotary positions, SwiGLU) runs 35 of its 36 layers, because Z-Image
+conditions on the penultimate hidden state.
+
+The transformer embeds 2x2 latent patches and the text states into a 3840-wide
+stream, refines each with two blocks, and runs 30 joint blocks over the
+concatenated sequence. Each block is modulated by a 256-dim timestep
+embedding (scale and tanh-gated residuals), uses RMS-normalised queries and
+keys, three-axis rotary positions (sequence, row, column), and a SwiGLU
+feed-forward. Sequences are padded to a multiple of 32 with learned pad
+tokens that take part in attention. Weights stay bf16 in memory and are
+expanded to float32 inside the GEMM.
+
+The flow-matching sampler uses sigmas from 1 to 1/N shifted by the
+scheduler's `shift` (3.0), feeds the model `t = 1 - sigma`, and takes Euler
+steps towards the model's prediction of `x0 - noise`.
+
 ### PNG writer (`src/image.h`)
 
 `encode_png` produces an 8-bit RGB PNG with three chunks: IHDR, IDAT and
@@ -547,8 +618,19 @@ cancellation, and an in-memory gallery of the last sixty results.
 
 ## Performance
 
-Measured on an Apple M1 Max (8 performance and 2 efficiency cores) with the
-built-in GEMM:
+Measured on an Apple M1 Max (8 performance and 2 efficiency cores).
+
+Z-Image-Turbo with the default macOS build (Accelerate):
+
+| | 512 x 512 | 1024 x 1024 |
+|---|---|---|
+| one transformer step | 8.2 s | 38.4 s |
+| full image, 9 steps and decode | 85 s | 372 s |
+| peak memory | 22 GB | 25 GB |
+
+With the built-in GEMM (`make ACCELERATE=0`) a 512x512 image takes 220 s.
+
+Stable Diffusion 1.5 with the built-in GEMM:
 
 | stage | time |
 |---|---|
@@ -579,8 +661,23 @@ Ways to make it faster, roughly in order of payoff:
 ```sh
 make test                 # kernel tests
 make test_tokenizer && ./test_tokenizer [model-dir]
+make test_qwen_tokenizer && ./test_qwen_tokenizer      # needs models/z-image-turbo/tokenizer
 python finetune/tests/test_config.py && python finetune/tests/test_lora.py   # fine-tuning framework
 ```
+
+The three Z-Image models are checked against PyTorch on the same inputs.
+`finetune/scripts/dump_reference.py` writes reference tensors with the
+`diffusers` and `transformers` implementations, and the C++ tests compare:
+
+```sh
+python finetune/scripts/dump_reference.py text && make test_qwen3 && ./test_qwen3     # relative error 1.4e-6
+python finetune/scripts/dump_reference.py vae && make test_vae && ./test_vae          # 1.1e-6
+python finetune/scripts/dump_reference.py transformer && make test_zimage && ./test_zimage   # 6e-6
+```
+
+Setting `ZIMAGE_TRACE=<prefix>` makes the transformer write its intermediate
+tensors, which the dump script also records, so a divergence can be located
+block by block.
 
 `test_ops` compares `gemm_nt`, `conv2d`, `attention`, `group_norm` and
 `layer_norm` against naive double-precision references on random inputs. It
@@ -625,12 +722,15 @@ pipeline has not been compared tensor by tensor against PyTorch.
 
 - CPU and float32 only; there is no GPU backend and no fp16 or quantised
   compute.
-- The pre-tokeniser treats every non-ASCII code point as a letter, and
-  lower-casing only affects ASCII. This differs from CLIP's Unicode-aware
-  regex for non-Latin text and punctuation.
+- The CLIP pre-tokeniser treats every non-ASCII code point as a letter, and
+  lower-casing only affects ASCII. The Qwen tokenizer classifies the common
+  punctuation, symbol and emoji blocks and matches the reference on CJK
+  text, but has no full Unicode tables and no NFC normalisation.
 - Prompt weighting syntax such as `(word:1.2)` is not parsed; it is tokenised
   as plain text.
-- SD 2.x and SDXL are not supported.
+- SD 2.x, SDXL, FLUX and SD 3 are not supported; Z-Image and SD 1.x are.
+- Z-Image needs about 25 GB of memory, since the text encoder and the
+  transformer stay loaded together.
 - Random numbers come from `std::mt19937_64`, so a seed does not reproduce
   the image a PyTorch pipeline makes with the same seed.
 - Only text-to-image is implemented. There is no image-to-image, inpainting
@@ -646,6 +746,8 @@ pipeline has not been compared tensor by tensor against PyTorch.
 | `cannot find models/sd15/unet/diffusion_pytorch_model[.fp16].safetensors` | Weights are missing or `--model-dir` is wrong. Run `scripts/download_sd15.sh`. |
 | `missing weight: <name>` | The checkpoint is not in diffusers SD 1.x layout. Convert it with the diffusers conversion script. |
 | `concat_channels: [...] vs [...]` | Width or height is not a multiple of 64. |
+| Process is killed, or the machine swaps heavily, with Z-Image | It needs about 25 GB free. Close other large programs, or use SD 1.5. |
+| `Z-Image: ...` or `Qwen3: ...` errors at load | The directory is incomplete; rerun `scripts/download_zimage.sh`, which resumes. |
 | `cannot open .../vocab.json` | The tokenizer files are missing from the model directory. |
 | Very slow generation | Check that `threads:` on the first line matches your core count, and that no other heavy process is running. |
 | `cannot bind 127.0.0.1:8080` | Another process uses the port; pass `--port`. |

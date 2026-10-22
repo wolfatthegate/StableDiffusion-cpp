@@ -113,10 +113,39 @@ Tensor DDIMScheduler::predict_x0(const Tensor& x, const Tensor& eps, int step) c
     return x0;
 }
 
+// ---------------------------------------------------------------------------
+void FlowMatchScheduler::set_timesteps(int steps) {
+    if (steps < 1) throw std::runtime_error("steps must be >= 1");
+    timesteps_.resize(steps);
+    sigmas_.resize(steps + 1);
+    for (int i = 0; i < steps; ++i) {
+        const float s = steps == 1 ? 1.0f : 1.0f - (float)i * (1.0f - 1.0f / (float)steps) / (float)(steps - 1);
+        const float shifted = shift_ * s / (1.0f + (shift_ - 1.0f) * s);
+        sigmas_[i] = shifted;
+        timesteps_[i] = shifted * 1000.0f;
+    }
+    sigmas_[steps] = 0.0f;
+}
+
+void FlowMatchScheduler::step(const Tensor& out, int step, Tensor& x) const {
+    const float dt = sigmas_[step] - sigmas_[step + 1];
+    float* p = x.ptr();
+    const float* o = out.ptr();
+    for (int64_t i = 0; i < x.numel(); ++i) p[i] += dt * o[i];
+}
+
+Tensor FlowMatchScheduler::predict_x0(const Tensor& x, const Tensor& out, int step) const {
+    const float s = sigmas_[step];
+    Tensor x0 = x;
+    for (int64_t i = 0; i < x0.numel(); ++i) x0.ptr()[i] += s * out.ptr()[i];
+    return x0;
+}
+
 std::unique_ptr<Scheduler> make_scheduler(const std::string& name) {
     if (name == "euler") return std::unique_ptr<Scheduler>(new EulerScheduler());
     if (name == "ddim") return std::unique_ptr<Scheduler>(new DDIMScheduler());
-    throw std::runtime_error("unknown sampler '" + name + "' (use euler or ddim)");
+    if (name == "flow") return std::unique_ptr<Scheduler>(new FlowMatchScheduler());
+    throw std::runtime_error("unknown sampler '" + name + "' (use euler, ddim or flow)");
 }
 
 }  // namespace sd

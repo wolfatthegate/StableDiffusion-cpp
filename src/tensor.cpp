@@ -35,6 +35,33 @@ Tensor& Tensor::reshape(std::vector<int64_t> s) {
     return *this;
 }
 
+uint16_t f32_to_bf16(float f) {
+    uint32_t bits;
+    std::memcpy(&bits, &f, 4);
+    if ((bits & 0x7F800000u) == 0x7F800000u) return (uint16_t)(bits >> 16);  // inf / NaN: truncate
+    const uint32_t lsb = (bits >> 16) & 1u;
+    bits += 0x7FFFu + lsb;  // round to nearest even
+    return (uint16_t)(bits >> 16);
+}
+
+void Tensor::to_f32() {
+    if (dtype == DType::F32) return;
+    data.resize(data16.size());
+    for (size_t i = 0; i < data16.size(); ++i) data[i] = bf16_to_f32(data16[i]);
+    std::vector<uint16_t>().swap(data16);
+    dtype = DType::F32;
+}
+
+void Tensor::to_bf16() {
+    if (dtype == DType::BF16) return;
+    data16.resize(data.size());
+    for (size_t i = 0; i < data.size(); ++i) data16[i] = f32_to_bf16(data[i]);
+    std::vector<float>().swap(data);
+    dtype = DType::BF16;
+}
+
+float Tensor::at(int64_t i) const { return dtype == DType::F32 ? data[(size_t)i] : bf16_to_f32(data16[(size_t)i]); }
+
 std::string Tensor::shape_str() const {
     std::ostringstream os;
     os << "[";
@@ -302,6 +329,74 @@ void gemm_nt(int64_t M, int64_t N, int64_t K, const float* A, int64_t lda, const
     });
 }
 
+// BF16 weights: each task expands its (n-block x k-slice) tile of B to a
+// thread-local float32 buffer, then runs the same micro-kernels. The tile is
+// reused across all 64 rows of A in the block, so the conversion costs about
+// 1/64 of the arithmetic and the packed tile is cache-friendly.
+void gemm_nt_bf16(int64_t M, int64_t N, int64_t K, const float* A, int64_t lda, const uint16_t* B, int64_t ldb,
+                  float* C, int64_t ldc, const float* bias, bool accumulate) {
+    if (M <= 0 || N <= 0) return;
+#ifdef USE_ACCELERATE
+    // BLAS path: expand the whole weight to float32 once per call (N*K floats,
+    // at most 160 MB for the largest Z-Image layer) and hand it to sgemm.
+    // The expansion is O(N*K) against O(M*N*K) for the product.
+    {
+        thread_local std::vector<float> expanded;
+        expanded.resize((size_t)(N * K));
+        // Take the pointer here: a thread_local named inside the lambda would
+        // resolve to each worker thread's own (empty) instance.
+        float* out = expanded.data();
+        parallel_chunks(N, 16, [&, out](int64_t jb, int64_t je) {
+            for (int64_t j = jb; j < je; ++j) {
+                const uint16_t* src = B + j * ldb;
+                float* dst = out + j * K;
+                for (int64_t k = 0; k < K; ++k) dst[k] = bf16_to_f32(src[k]);
+            }
+        });
+        gemm_nt(M, N, K, A, lda, out, K, C, ldc, bias, accumulate);
+        return;
+    }
+#endif
+    const int64_t MB = 64, NB = 128, KB = 128;
+    const int64_t mblocks = (M + MB - 1) / MB, nblocks = (N + NB - 1) / NB;
+    parallel_for(mblocks * nblocks, [&](int64_t t) {
+        thread_local std::vector<float> pack;
+        pack.resize((size_t)(NB * KB));
+        const int64_t m0 = (t / nblocks) * MB, m1 = std::min(M, m0 + MB);
+        const int64_t n0 = (t % nblocks) * NB, n1 = std::min(N, n0 + NB);
+        for (int64_t i = m0; i < m1; ++i) {
+            float* c = C + i * ldc;
+            if (!accumulate) {
+                if (bias)
+                    std::memcpy(c + n0, bias + n0, (n1 - n0) * sizeof(float));
+                else
+                    std::memset(c + n0, 0, (n1 - n0) * sizeof(float));
+            } else if (bias) {
+                for (int64_t j = n0; j < n1; ++j) c[j] += bias[j];
+            }
+        }
+        for (int64_t k0 = 0; k0 < K; k0 += KB) {
+            const int64_t kc = std::min(KB, K - k0);
+            for (int64_t j = n0; j < n1; ++j) {
+                const uint16_t* src = B + j * ldb + k0;
+                float* dst = pack.data() + (j - n0) * KB;
+                for (int64_t k = 0; k < kc; ++k) dst[k] = bf16_to_f32(src[k]);
+            }
+            for (int64_t i = m0; i < m1; i += 4) {
+                const int64_t mr = std::min<int64_t>(4, m1 - i);
+                for (int64_t j = n0; j < n1; j += 4) {
+                    const int64_t nr = std::min<int64_t>(4, n1 - j);
+                    const float* bp = pack.data() + (j - n0) * KB;
+                    if (mr == 4 && nr == 4)
+                        micro_4x4(kc, A + i * lda + k0, lda, bp, KB, C + i * ldc + j, ldc);
+                    else
+                        micro_edge(mr, nr, kc, A + i * lda + k0, lda, bp, KB, C + i * ldc + j, ldc);
+                }
+            }
+        }
+    });
+}
+
 // ============================================================================
 // Layers
 // ============================================================================
@@ -314,7 +409,26 @@ Tensor linear(const Tensor& x, const Tensor& W, const Tensor* b) {
     std::vector<int64_t> oshape = x.shape;
     oshape.back() = out;
     Tensor y(oshape);
-    gemm_nt(rows, out, in, x.ptr(), in, W.ptr(), in, y.ptr(), out, b ? b->ptr() : nullptr, false);
+    if (W.is_bf16())
+        gemm_nt_bf16(rows, out, in, x.ptr(), in, W.ptr16(), in, y.ptr(), out, b ? b->ptr() : nullptr, false);
+    else
+        gemm_nt(rows, out, in, x.ptr(), in, W.ptr(), in, y.ptr(), out, b ? b->ptr() : nullptr, false);
+    return y;
+}
+
+Tensor embedding(const Tensor& table, const std::vector<int32_t>& ids) {
+    const int64_t V = table.dim(0), D = table.dim(1);
+    Tensor y({(int64_t)ids.size(), D});
+    for (size_t i = 0; i < ids.size(); ++i) {
+        if (ids[i] < 0 || ids[i] >= V) throw std::runtime_error("embedding: id out of range");
+        float* o = y.ptr() + i * D;
+        if (table.is_bf16()) {
+            const uint16_t* r = table.ptr16() + (int64_t)ids[i] * D;
+            for (int64_t j = 0; j < D; ++j) o[j] = bf16_to_f32(r[j]);
+        } else {
+            std::memcpy(o, table.ptr() + (int64_t)ids[i] * D, D * sizeof(float));
+        }
+    }
     return y;
 }
 
@@ -414,7 +528,7 @@ Tensor group_norm(const Tensor& x, int groups, const Tensor& gamma, const Tensor
 }
 
 // Two-pass (mean, then variance) per row, rows processed in parallel.
-Tensor layer_norm(const Tensor& x, const Tensor& gamma, const Tensor& beta, float eps) {
+Tensor layer_norm(const Tensor& x, const Tensor* gamma, const Tensor* beta, float eps) {
     const int64_t C = x.dim(-1), rows = x.numel() / C;
     Tensor y(x.shape);
     parallel_chunks(rows, 8, [&](int64_t rb, int64_t re) {
@@ -430,8 +544,83 @@ Tensor layer_norm(const Tensor& x, const Tensor& gamma, const Tensor& beta, floa
                 var += (double)d * d;
             }
             const float rstd = (float)(1.0 / std::sqrt(var / C + eps));
-            for (int64_t i = 0; i < C; ++i) q[i] = (p[i] - mean) * rstd * gamma.ptr()[i] + beta.ptr()[i];
+            for (int64_t i = 0; i < C; ++i) {
+                float v = (p[i] - mean) * rstd;
+                if (gamma) v *= gamma->ptr()[i];
+                if (beta) v += beta->ptr()[i];
+                q[i] = v;
+            }
         }
+    });
+    return y;
+}
+
+Tensor rms_norm(const Tensor& x, const Tensor* gamma, float eps) {
+    const int64_t C = x.dim(-1), rows = x.numel() / C;
+    Tensor y(x.shape);
+    parallel_chunks(rows, 8, [&](int64_t rb, int64_t re) {
+        for (int64_t r = rb; r < re; ++r) {
+            const float* p = x.ptr() + r * C;
+            float* q = y.ptr() + r * C;
+            double ss = 0;
+            for (int64_t i = 0; i < C; ++i) ss += (double)p[i] * p[i];
+            const float rstd = (float)(1.0 / std::sqrt(ss / C + eps));
+            for (int64_t i = 0; i < C; ++i) q[i] = p[i] * rstd * (gamma ? gamma->ptr()[i] : 1.0f);
+        }
+    });
+    return y;
+}
+
+void rms_norm_heads_(Tensor& x, int64_t dim, const Tensor* gamma, float eps) {
+    const int64_t groups = x.numel() / dim;
+    parallel_chunks(groups, 64, [&](int64_t gb, int64_t ge) {
+        for (int64_t g = gb; g < ge; ++g) {
+            float* p = x.ptr() + g * dim;
+            double ss = 0;
+            for (int64_t i = 0; i < dim; ++i) ss += (double)p[i] * p[i];
+            const float rstd = (float)(1.0 / std::sqrt(ss / dim + eps));
+            for (int64_t i = 0; i < dim; ++i) p[i] = p[i] * rstd * (gamma ? gamma->ptr()[i] : 1.0f);
+        }
+    });
+}
+
+void rope_(Tensor& x, int64_t dim, const Tensor& cos, const Tensor& sin, bool interleaved) {
+    const int64_t inner = x.dim(-1), S = x.dim(-2), N = x.numel() / (S * inner), heads = inner / dim;
+    if (cos.dim(0) < S || cos.dim(1) != dim) throw std::runtime_error("rope_: table shape mismatch");
+    const int64_t half = dim / 2;
+    parallel_chunks(N * S, 16, [&](int64_t b, int64_t e) {
+        for (int64_t ns = b; ns < e; ++ns) {
+            const int64_t s = ns % S;
+            const float* c = cos.ptr() + s * dim;
+            const float* sn = sin.ptr() + s * dim;
+            for (int64_t h = 0; h < heads; ++h) {
+                float* p = x.ptr() + ns * inner + h * dim;
+                if (interleaved) {
+                    for (int64_t i = 0; i < dim; i += 2) {
+                        const float a = p[i], bb = p[i + 1];
+                        p[i] = a * c[i] - bb * sn[i];
+                        p[i + 1] = bb * c[i] + a * sn[i];
+                    }
+                } else {
+                    for (int64_t i = 0; i < half; ++i) {
+                        const float a = p[i], bb = p[i + half];
+                        p[i] = a * c[i] - bb * sn[i];
+                        p[i + half] = bb * c[i + half] + a * sn[i + half];
+                    }
+                }
+            }
+        }
+    });
+}
+
+Tensor swiglu(const Tensor& gate, const Tensor& up) {
+    if (gate.numel() != up.numel()) throw std::runtime_error("swiglu: shape mismatch");
+    Tensor y(gate.shape);
+    const float* g = gate.ptr();
+    const float* u = up.ptr();
+    float* o = y.ptr();
+    parallel_chunks(y.numel(), 16384, [&](int64_t b, int64_t e) {
+        for (int64_t i = b; i < e; ++i) o[i] = g[i] / (1.0f + std::exp(-g[i])) * u[i];
     });
     return y;
 }
@@ -462,12 +651,14 @@ void softmax_rows_(float* x, int64_t rows, int64_t cols, float scale, bool causa
 // head is a strided sub-matrix of q/k/v (leading dimension `inner`), so no
 // head splitting copies are needed except transposing V for the second GEMM.
 // Parallelism comes from inside gemm_nt and softmax_rows_.
-Tensor attention(const Tensor& q, const Tensor& k, const Tensor& v, int heads, bool causal) {
-    const int64_t N = q.dim(0), Sq = q.dim(1), inner = q.dim(2), Skv = k.dim(1);
-    if (inner % heads != 0) throw std::runtime_error("attention: inner dim not divisible by heads");
-    if (k.dim(0) != N || v.dim(0) != N || v.dim(1) != Skv || k.dim(2) != inner || v.dim(2) != inner)
-        throw std::runtime_error("attention: shape mismatch q" + q.shape_str() + " k" + k.shape_str());
+Tensor attention(const Tensor& q, const Tensor& k, const Tensor& v, int heads, bool causal, int kv_heads) {
+    if (kv_heads <= 0) kv_heads = heads;
+    const int64_t N = q.dim(0), Sq = q.dim(1), inner = q.dim(2), Skv = k.dim(1), kv_inner = k.dim(2);
+    if (inner % heads != 0 || heads % kv_heads != 0) throw std::runtime_error("attention: heads mismatch");
     const int64_t d = inner / heads;
+    if (k.dim(0) != N || v.dim(0) != N || v.dim(1) != Skv || kv_inner != kv_heads * d || v.dim(2) != kv_inner)
+        throw std::runtime_error("attention: shape mismatch q" + q.shape_str() + " k" + k.shape_str());
+    const int64_t group = heads / kv_heads;
     const float scale = 1.0f / std::sqrt((float)d);
     Tensor out({N, Sq, inner});
     std::vector<float> scores((size_t)(Sq * Skv));
@@ -475,15 +666,15 @@ Tensor attention(const Tensor& q, const Tensor& k, const Tensor& v, int heads, b
     for (int64_t n = 0; n < N; ++n) {
         for (int h = 0; h < heads; ++h) {
             const float* qh = q.ptr() + n * Sq * inner + h * d;
-            const float* kh = k.ptr() + n * Skv * inner + h * d;
-            const float* vh = v.ptr() + n * Skv * inner + h * d;
+            const float* kh = k.ptr() + n * Skv * kv_inner + (h / group) * d;
+            const float* vh = v.ptr() + n * Skv * kv_inner + (h / group) * d;
             // scores = Q_h K_h^T, then softmax with the 1/sqrt(d) scale
-            gemm_nt(Sq, Skv, d, qh, inner, kh, inner, scores.data(), Skv);
+            gemm_nt(Sq, Skv, d, qh, inner, kh, kv_inner, scores.data(), Skv);
             softmax_rows_(scores.data(), Sq, Skv, scale, causal);
             // out_h = P V_h. gemm_nt needs V_h transposed ([d, Skv]) so that
             // the product is again "row times row".
             for (int64_t s = 0; s < Skv; ++s)
-                for (int64_t j = 0; j < d; ++j) vT[j * Skv + s] = vh[s * inner + j];
+                for (int64_t j = 0; j < d; ++j) vT[j * Skv + s] = vh[s * kv_inner + j];
             gemm_nt(Sq, d, Skv, scores.data(), Skv, vT.data(), Skv, out.ptr() + n * Sq * inner + h * d, inner);
         }
     }

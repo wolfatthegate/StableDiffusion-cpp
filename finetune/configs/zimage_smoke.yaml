@@ -1,0 +1,41 @@
+# Tiny end-to-end check of the Z-Image training path on the synthetic shapes
+# dataset: a few LoRA steps at 256 px with the Turbo weights (fine for a
+# smoke test, not for real training), then an export that ./sd can load.
+model:
+  base: models/z-image-turbo
+  family: z-image
+  weights_dtype: bf16
+
+data:
+  path: data/sample-shapes
+  resolution: 256
+  caption_dropout: 0.0
+  cache_latents: true
+
+weights:
+  method: lora
+  unet:
+    train: true
+    include: ["^layers\\.(0|1)\\."]   # two blocks, to keep the test quick
+  lora:
+    rank: 4
+    alpha: 4
+
+train:
+  steps: 4
+  batch_size: 1
+  lr: 1.0e-4
+  lr_scheduler: constant
+  precision: fp32
+  seed: 0
+
+checkpoint:
+  dir: runs/zimage-smoke
+  every: 2
+  keep: 2
+
+logging:
+  every: 1
+
+export:
+  output_dir: models/zimage-smoke-export
