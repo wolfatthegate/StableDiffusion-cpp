@@ -1,7 +1,7 @@
 # StableDiffusion-cpp
 
 Text-to-image inference written from scratch in C++17, running two model
-families on the CPU:
+families on the CPU, or on an NVIDIA GPU with the optional CUDA backend:
 
 - **Z-Image** (`Tongyi-MAI/Z-Image-Turbo`, Apache 2.0): a 6B single-stream
   diffusion transformer with a Qwen3-4B text encoder and the FLUX VAE, among
@@ -10,9 +10,10 @@ families on the CPU:
 - **Stable Diffusion 1.x**: the original 860M UNet model, kept for its speed
   and small size.
 
-There are no third-party dependencies in the default build. PyTorch, ONNX,
-image libraries and JSON libraries are all absent. Every piece of the
-pipeline is implemented in `src/`:
+There are no third-party libraries. PyTorch, ONNX, image libraries and JSON
+libraries are all absent; the only optional dependencies are Apple's
+Accelerate framework on macOS and the CUDA toolkit for the GPU backend.
+Every piece of the pipeline is implemented in `src/`:
 
 - the numeric kernels: GEMM (float32 and bf16 weights), convolution,
   attention with grouped query heads, RMS / layer / group normalisation,
@@ -22,7 +23,7 @@ pipeline is implemented in `src/`:
 - the CLIP and Qwen3-4B text encoders, the SD UNet, the Z-Image transformer
   and the VAE decoder
 - Euler, DDIM and flow-matching samplers
-- a PNG writer
+- a PNG writer and a small HTTP server for the web interface
 
 On macOS the GEMM goes through Apple's Accelerate framework by default
 (`make ACCELERATE=0` keeps everything hand-written); every other platform
@@ -51,20 +52,28 @@ Both from `--prompt "a photo of an astronaut riding a horse on mars, highly deta
 3. [Model weights](#model-weights)
 4. [Command-line reference](#command-line-reference)
 5. [Web interface](#web-interface)
-6. [Fine-tuning](#fine-tuning)
-7. [How Stable Diffusion works](#how-stable-diffusion-works)
-8. [Code tour](#code-tour)
-9. [Component reference](#component-reference)
-10. [Design decisions](#design-decisions)
-11. [Performance](#performance)
-12. [Testing](#testing)
-13. [Extending the code](#extending-the-code)
-14. [Limitations](#limitations)
-15. [Troubleshooting](#troubleshooting)
+6. [GPU acceleration](#gpu-acceleration)
+7. [Fine-tuning](#fine-tuning)
+8. [How the models work](#how-the-models-work)
+9. [Code tour](#code-tour)
+10. [Component reference](#component-reference)
+11. [Design decisions](#design-decisions)
+12. [Performance](#performance)
+13. [Testing](#testing)
+14. [Extending the code](#extending-the-code)
+15. [Limitations](#limitations)
+16. [Troubleshooting](#troubleshooting)
 
-For profiling results, processor differences, using fine-tuned weights, and a
-map of where to change the code for speed or quality, see
-[docs/IMPROVEMENTS.md](docs/IMPROVEMENTS.md).
+Further documents:
+
+- [docs/ADR-001-model-upgrade.md](docs/ADR-001-model-upgrade.md): why
+  Z-Image was chosen over the other open-weight models, with sources and
+  measurements.
+- [docs/IMPROVEMENTS.md](docs/IMPROVEMENTS.md): profiling results,
+  processor differences, using fine-tuned weights, and a map of where to
+  change the code for speed or quality.
+- [finetune/README.md](finetune/README.md): the full fine-tuning option
+  reference.
 
 ## Quick start
 
@@ -92,14 +101,18 @@ Requirements:
 - A POSIX system, because the weight loader uses `mmap`. macOS and Linux are
   supported. Windows would need a replacement for the memory map in
   `src/safetensors.cpp`.
+- Optional: the CUDA toolkit (`nvcc`, cuBLAS) for `make CUDA=1`.
 
 Targets:
 
 ```sh
-make                 # ./sd (command line) and ./sd-server (web interface)
-make test            # build and run ./test_ops (kernel tests, no weights needed)
-make test_tokenizer  # build ./test_tokenizer (needs the tokenizer files)
-make clean           # remove build/ and all binaries
+make                     # ./sd (command line) and ./sd-server (web interface)
+make test                # build and run ./test_ops (kernel tests, no weights needed)
+make test_tokenizer      # CLIP tokenizer test (needs models/sd15)
+make test_qwen_tokenizer # Qwen tokenizer test (needs models/z-image-turbo)
+make test_qwen3 test_vae test_zimage   # model tests against PyTorch dumps, see Testing
+make cuda-syntax-check   # parse the CUDA backend with clang, no CUDA toolkit needed
+make clean               # remove build/ and all binaries
 ```
 
 Build options:
@@ -164,7 +177,7 @@ diffusers conversion script, because the tensor names differ.
 | flag | short | default | meaning |
 |---|---|---|---|
 | `--prompt` | `-p` | required | what to draw |
-| `--negative` | `-n` | empty | what to steer away from; needs `--cfg` above 0 (SD 1.x) or above 0 (Z-Image base) |
+| `--negative` | `-n` | empty | what to steer away from. Used only when guidance is on: SD 1.x with `--cfg` other than 0 or 1, the Z-Image base with `--cfg` above 0. Z-Image-Turbo ignores it |
 | `--model-dir` | `-m` | `models/sd15` | diffusers-layout model directory |
 | `--steps` | | 20 (SD), 9 (Z-Image) | number of sampler steps |
 | `--cfg` | | 7.5 (SD), 0 (Z-Image) | guidance scale; `0` or `1` disables it. Z-Image-Turbo is trained without guidance and must use 0 |
@@ -177,15 +190,18 @@ diffusers conversion script, because the tensor names differ.
 | `--output` | `-o` | `output.png` | output PNG path |
 | `--help` | `-h` | | print usage |
 
-Progress goes to stderr:
+Options that are not given take the model family's defaults. Progress goes
+to stderr:
 
 ```
 threads: 10
-text encoder: 12 layers, 0.2s
-unet: 859.52M params loaded in 0.4s
-step  1/20  t= 999.00  4.4s
+z-image models loaded in 28.2s (generator: 6155M params, cpu)
+1024x1024, 9 steps, sampler flow, cfg 0
+step  1/9  t=1000.00  42.4s
 ...
-vae decode + save: 7.2s -> output.png
+step  9/9  t= 272.73  38.4s
+decoding...
+seed 42, 371.7s total -> output.png
 ```
 
 Practical notes:
@@ -203,20 +219,23 @@ Practical notes:
 ## Web interface
 
 ```sh
-./sd-server [--model-dir models/sd15] [--host 127.0.0.1] [--port 8080] [--threads N] [--web-dir web]
+./sd-server [--model-dir models/sd15] [--device auto] [--host 127.0.0.1] [--port 8080] [--threads N] [--web-dir web]
 ```
 
 Open the printed address in a browser. The page has the same controls as the
-command line.
+command line. It reads the model family from the server and adjusts itself:
+sizes, step count, guidance and the sampler list default to the loaded
+model's values, and the status line shows the model and whether the CPU or
+the GPU is in use.
 
 ![web interface during generation](examples/web-ui.png)
 
 While an image is being generated it shows:
 
 - a **live preview** that sharpens step by step. Every step the server turns
-  the predicted clean latent into a small RGB image with a fixed 4-to-3 colour
-  map (no VAE pass), and the page shows it with a blur that shrinks as the
-  steps progress;
+  the predicted clean latent into a small RGB image with a fixed per-channel
+  colour map (4 channels for SD, 16 for Z-Image; no VAE pass), and the page
+  shows it with a blur that shrinks as the steps progress;
 - a progress ring with step count, the **time remaining** estimated from the
   measured step times, elapsed time, seconds per step and the current
   timestep;
@@ -225,13 +244,14 @@ While an image is being generated it shows:
 
 Finished images appear in a strip with their settings; one click reloads
 them into the form, and a Delete button (or the cross on a thumbnail)
-removes an image from the server after a confirmation. The seed used for a random-seed run is shown so an image
-can be reproduced. Form values persist in the browser. Reloading the page
+removes an image from the server after a confirmation. The seed used for a
+random-seed run is shown so an image can be reproduced. Form values persist in the browser. Reloading the page
 re-attaches to a generation already in progress.
 
 The server loads all models once (about 25 GB for Z-Image, 6 GB for SD 1.x)
-and runs one generation at a time; further requests wait in a queue and the page shows
-the position. `--host 0.0.0.0` makes it reachable from other machines on
+and runs one generation at a time; further requests wait in a queue and the
+page shows the position. Finished images are kept in memory only (the last
+sixty); use Download to keep one. `--host 0.0.0.0` makes it reachable from other machines on
 the network. There is no authentication, so keep it on a trusted network.
 
 The server is written in the same dependency-free style: a small HTTP/1.1
@@ -280,13 +300,15 @@ first step includes cuBLAS warm-up. A 16 GB card fits Z-Image at 1024x1024;
 products (SD 1.5), roughly twice as fast with about 1e-3 relative error.
 
 Validation: `./test_ops` runs every op on both devices with the same inputs
-and prints `cuda <op>  max|err|` lines; `./test_zimage --device` is not
-needed, since generating with and without `--device cpu` from the same seed
-should give images that differ only by float rounding. The backend was
-written and parse-checked without an NVIDIA GPU at hand (`make
-cuda-syntax-check` runs that check with clang), so the first run on real
-hardware is the acceptance test. If an op fails there, its kernel is a few
-lines in `backend_cuda.cu` next to the CPU version it must match.
+and prints a `cuda <op>  max|err|` line for each. As an end-to-end check,
+the same prompt and seed with and without `--device cpu` should give images
+that differ only by float rounding.
+
+Status: the backend was written and parse-checked on a Mac without an
+NVIDIA GPU (`make cuda-syntax-check` runs that check with clang and
+stand-in headers), and has not yet run on real hardware. The first run is
+the acceptance test. If an op fails there, its kernel is a few lines in
+`backend_cuda.cu`, and the CPU version it must match is in `tensor.cpp`.
 
 ## Fine-tuning
 
@@ -315,16 +337,33 @@ caching, checkpoints with resume and periodic sample images. Export merges
 adapters into the weights and writes a complete diffusers directory, so both
 this project and `diffusers` can load the result.
 
-## How Stable Diffusion works
+## How the models work
 
 Both models are *latent* diffusion models. Rather than denoising pixels,
 they denoise a small latent image 8 times smaller than the output (4
 channels for SD, 16 for Z-Image), and a separate decoder turns the final
 latent into pixels. The text goes in through a frozen language model: CLIP
-for SD 1.x, the Qwen3-4B decoder for Z-Image. The diagram below shows the
-SD 1.x pipeline; Z-Image replaces the UNet with a transformer that attends
-jointly over image and text tokens, uses flow matching instead of a noise
-schedule, and needs no guidance pass.
+for SD 1.x, the Qwen3-4B decoder for Z-Image.
+
+### Z-Image
+
+```
+prompt ──> chat template ──> QwenTokenizer ──> Qwen3-4B (35 of 36 layers) ──> text states [L, 2560]
+                                                                                   │
+noise [16, H/8, W/8] ──> for each of 9 steps:  out = Transformer(x, t = 1 - sigma, text) ──> x += (sigma - sigma_next) * out
+                                                                                   │
+x / 0.3611 + 0.1159 ──> VAEDecoder (FLUX) ──> RGB in [-1, 1] ──> PNG
+```
+
+The transformer cuts the latent into 2x2 patches and processes image and
+text tokens as one sequence, so every image patch attends to every word and
+to every other patch. It is trained with *flow matching*: the noisy latent is
+a straight-line mix `x = (1 - sigma) * x0 + sigma * noise`, and the model
+predicts the direction from noise to image. The Turbo checkpoint was
+distilled to need only 8 or 9 such steps and no guidance pass, which is
+why a 6B model is affordable on a CPU.
+
+### Stable Diffusion 1.x
 
 ```
 prompt ──> CLIPTokenizer ──> CLIPTextEncoder ──┐ context [2, 77, 768]
@@ -382,37 +421,47 @@ web/
   index.html             the web interface, one file, no frameworks
 finetune/
   sdft/                  Python fine-tuning framework (see finetune/README.md)
-  configs/               example configs: lora.yaml, full.yaml, smoke.yaml
+  configs/               zimage_lora.yaml, zimage_smoke.yaml; lora.yaml, full.yaml, smoke.yaml for SD 1.x
+  scripts/               make_sample_dataset.py, dump_reference.py (PyTorch reference tensors)
+docs/
+  ADR-001-model-upgrade.md   model choice; IMPROVEMENTS.md   profiling and code map
 tests/
-  test_ops.cpp           kernel tests against naive references, plus GEMM benchmarks
+  test_ops.cpp           kernel tests against naive references (and GPU vs CPU with CUDA), GEMM benchmarks
   test_tokenizer.cpp     CLIP tokenizer tests against known token ids
   test_qwen_tokenizer.cpp  Qwen tokenizer against fixtures from the Hugging Face tokenizer
   test_qwen3.cpp, test_vae.cpp, test_zimage.cpp   each model against a PyTorch reference dump
   fixtures/              tokenizer fixtures; reference dumps are generated locally
+  cuda_stub/             stand-in CUDA headers for make cuda-syntax-check
 scripts/
-  download_sd15.sh       weight downloader
+  download_zimage.sh     Z-Image weight downloader (ZIMAGE_REPO selects Turbo or the base)
+  download_sd15.sh       SD 1.5 weight downloader
 examples/                sample outputs shown above
 ```
 
 Dependencies flow strictly upwards:
 
 ```
-main.cpp, server.cpp ──> pipeline ──┬── clip, unet, vae ──> modules ──> safetensors ──> json
-                        (server.cpp │                          └──────> tensor
-                         also http) ├── tokenizer ──> json
+main.cpp, server.cpp ──> pipeline ──┬── zimage, qwen3, clip, unet, vae ──> modules ──> safetensors ──> json
+                        (server.cpp │                                        └──────> tensor ──> backend_cuda
+                         also http) ├── qwen_tokenizer, tokenizer ──> json
                                     ├── scheduler ──> tensor
                                     └── image
 ```
 
+`backend_cuda` is either the CUDA implementation or a stub, chosen at build
+time; nothing above `tensor` knows which.
+
 Suggested reading order for a review:
 
 1. `src/tensor.h`, for the data model and operator contracts.
-2. `src/pipeline.cpp`, for the end-to-end pipeline.
-3. `src/modules.h` and `src/modules.cpp`, for the layers.
-4. `src/unet.h`, `src/clip.h` and `src/vae.h`, which describe each model's
-   layout in their header comments.
+2. `src/pipeline.cpp`, for both end-to-end pipelines.
+3. `src/zimage.h` and `src/qwen3.h`, which describe the Z-Image
+   architecture in their header comments.
+4. `src/modules.h`, `src/unet.h`, `src/clip.h` and `src/vae.h`, for the SD
+   layers and model layouts.
 5. `src/scheduler.h`, for the sampling maths.
-6. `src/tensor.cpp`, for how the kernels are implemented.
+6. `src/tensor.cpp`, for how the CPU kernels are implemented, and
+   `src/backend_cuda.cu` for their GPU counterparts.
 
 Every header documents its public API. Every source file starts with a
 summary and comments its non-obvious steps.
@@ -421,9 +470,18 @@ summary and comments its non-obvious steps.
 
 ### Tensor and operators (`src/tensor.h`)
 
-`Tensor` is a shape plus a contiguous row-major `std::vector<float>`. There are
-no strides, views, dtypes or devices. Operators return new tensors, except
-those whose names end in `_`, which work in place.
+`Tensor` is a shape plus contiguous row-major storage. It has two element
+types and two devices, and no strides or views:
+
+- **dtype**: F32, or BF16 for large model weights (half the memory; only
+  `linear` and `embedding` accept BF16 inputs, and activations are always
+  F32).
+- **device**: CPU (`std::vector` storage) or CUDA (a GPU allocation).
+  Every operator checks that its inputs share a device and runs the matching
+  implementation; `to(Device)` copies across.
+
+Operators return new tensors, except those whose names end in `_`, which
+work in place.
 
 Two activation layouts are used:
 
@@ -442,10 +500,14 @@ transformer block.
 | `conv2d(x, W, b, stride, pad)` | `nn.Conv2d` via im2col + GEMM |
 | `group_norm(x, groups, gamma, beta, eps)` | `nn.GroupNorm` |
 | `layer_norm(x, gamma, beta, eps)` | `nn.LayerNorm` over the last dimension |
-| `attention(q, k, v, heads, causal)` | multi-head `softmax(Q K^T / sqrt(d)) V` |
-| `geglu(x)` | `a * gelu(g)` where `[a, g]` split the last dimension |
-| `silu_`, `gelu_`, `quick_gelu_` | in-place activations |
-| `upsample_nearest2x`, `concat_channels`, `concat_batch`, `slice_batch`, `repeat_batch` | shape helpers |
+| `rms_norm(x, gamma, eps)`, `rms_norm_heads_` | RMS normalisation per row, or per head (QK-norm) |
+| `attention(q, k, v, heads, causal, kv_heads)` | multi-head `softmax(Q K^T / sqrt(d)) V`, with grouped-query sharing when `kv_heads < heads` |
+| `rope_(x, dim, cos, sin, interleaved)` | rotary position embedding, rotate-half (Qwen) or interleaved (Z-Image) convention |
+| `geglu(x)`, `swiglu(gate, up)` | gated activations of the SD and Z-Image feed-forward layers |
+| `embedding(table, ids)` | row lookup in an F32 or BF16 table |
+| `silu_`, `gelu_`, `quick_gelu_`, `add_`, `scale_`, `affine_` | in-place elementwise ops |
+| `mul_rows_`, `add_rows_scaled_`, `add_channel_bias_` | broadcasts for adaLN modulation and time embeddings |
+| `upsample_nearest2x`, `concat_channels`, `concat_batch`, `slice_batch`, `repeat_batch`, `slice_rows`, `patchify2d`, `unpatchify2d` | shape helpers |
 
 Threading uses one global pool. `parallel_for(n, fn)` hands out item indices
 dynamically from an atomic counter and the calling thread joins in.
@@ -469,6 +531,13 @@ NEON or SSE/AVX. It reaches about 550 to 600 GFLOP/s on a 10-core M-series
 CPU. There is no operand packing, which keeps the code short at some cost in
 peak speed.
 
+`gemm_nt_bf16` takes BF16 weights: each task expands its tile of B to
+float32 in a thread-local buffer and runs the same micro-kernel, so
+conversion costs about 1/64 of the arithmetic. On macOS, where the default
+build uses Accelerate, both entry points go to `cblas_sgemm` instead (the
+BF16 one after expanding the weight), which reaches about 2 TFLOP/s on the
+M1 Max.
+
 ### Convolution
 
 `conv2d` uses im2col. Each output pixel's input patch is copied into one row of
@@ -483,23 +552,31 @@ full-image im2col in the VAE's last stage would need more than 2 GB.
 `attention` loops over heads. For each head it computes the full score matrix
 `Q_h K_h^T`, applies a numerically stable softmax in place, transposes `V_h`,
 and multiplies. The heads are strided slices of the projected tensors, so no
-reshaping copies are needed. At the UNet's highest resolution the score
-matrix is 4096 x 4096 floats, or 64 MB. There is no flash-attention style
-tiling.
+reshaping copies are needed. With grouped-query attention (Qwen3: 32
+query heads, 8 key/value heads) consecutive query heads read the same key
+and value slice. For Z-Image at 1024x1024 the joint sequence is 4,096 image
+tokens plus the padded prompt, so the score matrix is at most about 4,600 x
+4,600 floats, or 85 MB per head. There is no flash-attention style tiling.
 
 ### Weight loading (`src/safetensors.h`)
 
 A `.safetensors` file is an 8-byte header length, a JSON header that
 describes each tensor's dtype, shape and byte range, and then raw data.
 `Weights::load_safetensors` memory-maps the file, parses the header,
-allocates every tensor, and converts them to float32 in parallel. Half
-precision conversion is bit-exact, including subnormals, infinities and NaN.
-Tensors of other dtypes are skipped with a message. The only such tensor in
-SD 1.5 is CLIP's integer `position_ids` buffer, which is not needed.
+allocates every tensor, and converts them in parallel: to float32 by
+default, or, with `keep_bf16`, large tensors to BF16 (the Z-Image models)
+while norms and biases stay float32. Half precision conversion is
+bit-exact, including subnormals, infinities and NaN. Tensors of other dtypes
+are skipped with a message; the only such tensor is CLIP's integer
+`position_ids` buffer, which is not needed.
+
+`Weights::load_model(dir, base)` finds `base.safetensors`, a sharded set
+listed in `base.safetensors.index.json`, or the `.fp16` variant.
+`Weights::to_device(Device::CUDA)` moves every tensor to the GPU.
 
 `Weights` maps names to tensors. Model classes keep raw pointers into it, so
-it must outlive them. `Pipeline` owns one `Weights` per model and keeps all
-three loaded for its lifetime.
+it must outlive them. `Pipeline` owns one `Weights` per model and keeps them
+loaded for its lifetime.
 
 ### Tokenizer (`src/tokenizer.h`)
 
@@ -633,8 +710,9 @@ previews in its progress events.
 
 ### Pipeline and server (`src/pipeline.h`, `src/http.h`, `src/server.cpp`)
 
-`Pipeline` loads the tokenizer and the three models once and exposes
-`generate(params, progress)`. The progress callback is called before text
+`Pipeline` reads `model_index.json` to pick the family, loads the tokenizer
+and models once, places the generator and VAE on the requested device, and
+exposes `generate(params, progress)` and `defaults()`. The progress callback is called before text
 encoding, after every sampler step (with the step time and the predicted
 clean latent), and before decoding; returning `false` cancels after the
 current step. `latent_to_rgb` turns a latent into a rough RGB preview with
@@ -651,17 +729,26 @@ cancellation, and an in-memory gallery of the last sixty results.
 - **Readability over peak speed.** Every operator is a plain loop or a call
   to the one GEMM. There is no graph compiler, operator fusion, or
   hand-written assembly.
-- **float32 everywhere.** Weights are stored as fp16 on disk but expanded to
-  float32 in memory. This doubles memory use to about 3.4 GB for the UNet
-  but keeps the arithmetic simple and accurate.
-- **Structure from weights.** Models discover their layout from tensor names
-  instead of a config file, so there is no `config.json` parser and
-  fine-tunes load unchanged.
-- **Models stay loaded.** `Pipeline` holds the text encoder, UNet and VAE
-  together (about 6 GB in use, float32) so the server can answer many
-  requests; the command-line tool pays the same cost for one image.
-- **Batched guidance.** The conditional and unconditional UNet passes run as
-  one batch of two, so weights are read once per step.
+- **float32 arithmetic, bf16 storage where it matters.** All activations and
+  arithmetic are float32. SD weights are expanded to float32 in memory (3.4
+  GB for the UNet); the 6B Z-Image transformer and 4B text encoder stay bf16
+  (20 GB instead of 40) and are expanded inside the GEMM.
+- **Structure from weights.** Models discover block counts and widths from
+  tensor names and shapes, so fine-tunes load unchanged. The few
+  hyper-parameters weights cannot reveal (Z-Image head count, rotary bases,
+  VAE scale and shift, sampler shift) are read from the `config.json` files.
+- **Verified against the reference.** Each Z-Image component is compared
+  with the PyTorch implementation on identical inputs, and a trace facility
+  locates divergences block by block.
+- **Models stay loaded.** `Pipeline` keeps all components resident (25 GB for
+  Z-Image, 6 GB for SD 1.5) so the server can answer many requests; the
+  command-line tool pays the same cost for one image.
+- **One code path, two devices.** Tensors carry their device and each
+  operator dispatches on it, so the model code is written once and the CPU
+  path stays exactly as it was when the GPU backend is not built.
+- **Batched guidance.** For SD the conditional and unconditional UNet passes
+  run as one batch of two, so weights are read once per step. Z-Image-Turbo
+  needs no guidance pass at all.
 
 ## Performance
 
@@ -677,7 +764,8 @@ Z-Image-Turbo with the default macOS build (Accelerate):
 
 With the built-in GEMM (`make ACCELERATE=0`) a 512x512 image takes 220 s.
 
-Stable Diffusion 1.5 with the built-in GEMM:
+Stable Diffusion 1.5 with the built-in GEMM (with Accelerate a step takes
+2.5 s instead of 4.3 s):
 
 | stage | time |
 |---|---|
@@ -691,17 +779,19 @@ Peak memory footprint at 512x512 is about 6.0 GB with all three models
 loaded in float32.
 
 These numbers come from an Apple M1 Max and will differ on other processors.
-[docs/IMPROVEMENTS.md](docs/IMPROVEMENTS.md) has the full profile, an
-Accelerate comparison (2.5 s per step instead of 4.3 s), the reasons results
-vary between machines, and a code map for making the model faster or better.
+[docs/IMPROVEMENTS.md](docs/IMPROVEMENTS.md) has the full profile, the
+reasons results vary between machines, and a code map for making the models
+faster or better. GPU timings are estimates until the CUDA backend has been
+measured on hardware; see [GPU acceleration](#gpu-acceleration).
 
 Ways to make it faster, roughly in order of payoff:
 
-- Build with `make ACCELERATE=1` on macOS to use Apple's tuned BLAS. It is
-  measured at 1.7x faster per step, with output within one pixel level.
-- Use `--cfg 1` to skip the unconditional pass, at a cost in prompt adherence.
-- Use fewer steps; DDIM is usable at 15.
-- Generate at a smaller size such as 384x384.
+- Build with `make CUDA=1` on a machine with an NVIDIA GPU.
+- On macOS, keep the default Accelerate build; `ACCELERATE=0` is 2.6x slower
+  for Z-Image.
+- Draft Z-Image at 512x512 (85 s), then render the keeper at 1024x1024.
+- For SD, use `--cfg 1` to skip the unconditional pass at a cost in prompt
+  adherence, use fewer steps (DDIM is usable at 15), or a smaller size.
 
 ## Testing
 
@@ -726,11 +816,14 @@ Setting `ZIMAGE_TRACE=<prefix>` makes the transformer write its intermediate
 tensors, which the dump script also records, so a divergence can be located
 block by block.
 
-`test_ops` compares `gemm_nt`, `conv2d`, `attention`, `group_norm` and
-`layer_norm` against naive double-precision references on random inputs. It
-uses odd sizes and padded leading dimensions to exercise the edge-tile and
-stride paths. It then benchmarks one GEMM shaped like a UNet convolution. It
-needs no weights and exits non-zero on any failure.
+`test_ops` compares the CPU kernels (float32 and bf16 GEMM, `conv2d`,
+attention including grouped-query and causal, group/layer/RMS norms, both
+rotary conventions, SwiGLU, bf16 rounding) against naive double-precision
+references on random inputs, with odd sizes and padded leading dimensions
+to exercise the edge-tile and stride paths. When built with `CUDA=1` and a
+GPU is present it also runs every operator on the GPU and compares with the
+CPU result. It ends with two GEMM benchmarks, needs no weights, and exits
+non-zero on any failure.
 
 `test_tokenizer` checks case folding, contractions, digits, punctuation runs,
 empty input and the 77-token padding against ids from the real vocabulary.
@@ -742,16 +835,22 @@ save and load round-trip).
 
 End-to-end correctness was checked by generating the example images above,
 by exercising every server endpoint with `curl` and headless Chrome, and by
-training a LoRA with `finetune/configs/smoke.yaml`, exporting it, and
-generating from the export with `./sd`. An untrained model passed through
-the export produces pixel-identical output to the original weights. The
-pipeline has not been compared tensor by tensor against PyTorch.
+training LoRAs with `finetune/configs/smoke.yaml` and `zimage_smoke.yaml`,
+exporting them, and generating from the exports with `./sd`. An untrained
+SD model passed through the export produces pixel-identical output to the
+original weights. The Z-Image components are compared tensor by tensor with
+PyTorch as above; the SD 1.5 pipeline has only been checked by its output
+images.
 
 ## Extending the code
 
 - **New operator.** Declare it in `src/tensor.h` with a comment describing
   shapes, implement it in `src/tensor.cpp` using `parallel_for` or
-  `parallel_chunks`, and add a reference check to `tests/test_ops.cpp`.
+  `parallel_chunks`, and add a reference check to `tests/test_ops.cpp`. For
+  GPU support, add a function to `src/backend_cuda.h`, its kernel to
+  `src/backend_cuda.cu`, a throwing stub to `src/backend_cuda_stub.cpp`, a
+  dispatch at the top of the CPU version, and a line to `test_cuda` in
+  `tests/test_ops.cpp`.
 - **New sampler.** Subclass `Scheduler` in `src/scheduler.h`, implement
   `set_timesteps` and `step`, and override `init_noise_sigma` and
   `scale_model_input` if the sampler works in sigma space. Register it in
@@ -762,8 +861,13 @@ pipeline has not been compared tensor by tensor against PyTorch.
 - **SD 2.x.** Change the UNet head count to use a fixed head dimension of 64,
   swap the text encoder for OpenCLIP ViT-H with penultimate-layer output, and
   add v-prediction to the samplers.
-- **Faster kernels.** Everything heavy goes through `gemm_nt`, so packing,
-  larger register tiles or a BLAS backend there speed up the whole model.
+- **Faster kernels.** Everything heavy goes through `gemm_nt` and
+  `gemm_nt_bf16`, so packing or larger register tiles there speed up both
+  models on the CPU. On the GPU, the next step is a fused (flash) attention
+  kernel in place of the per-head score matrix.
+- **Another model family.** Add its components beside `zimage.cpp`, a
+  `Family` value and a `generate_*` function in `pipeline.cpp`, and a
+  reference test in the style of `test_zimage.cpp`.
 
 ## Limitations
 
@@ -798,7 +902,7 @@ pipeline has not been compared tensor by tensor against PyTorch.
 | `CUDA requested but not available` | The binary was built without `CUDA=1`, or no NVIDIA device is visible; use `--device cpu` or rebuild. |
 | `CUDA error in cudaMalloc` | The GPU is out of memory; use a smaller size, SD 1.5, or close other GPU programs. |
 | `cannot open .../vocab.json` | The tokenizer files are missing from the model directory. |
-| Very slow generation | Check that `threads:` on the first line matches your core count, and that no other heavy process is running. |
+| Very slow generation | Check that `threads:` on the first line matches your core count, that the model line ends with `cuda` if you expect the GPU, and that no other heavy process is running. On macOS, check the build did not use `ACCELERATE=0`. |
 | `cannot bind 127.0.0.1:8080` | Another process uses the port; pass `--port`. |
 | `web/index.html not found` in the browser | Start `sd-server` from the repository root or pass `--web-dir`. |
 | Page shows "server unreachable" | The server is still loading the weights, or it was started with a different `--port`. |
