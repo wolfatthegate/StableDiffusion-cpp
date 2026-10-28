@@ -6,7 +6,6 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
-#include <cstring>
 #include <fstream>
 #include <stdexcept>
 
@@ -15,9 +14,10 @@ namespace sd {
 namespace {
 // Debug aid: with ZIMAGE_TRACE=<prefix> set, intermediate tensors are written
 // as <prefix>_trace_<name>.bin/.json for comparison with the PyTorch trace.
-void trace(const char* name, const Tensor& t) {
+void trace(const char* name, const Tensor& t_in) {
     const char* prefix = std::getenv("ZIMAGE_TRACE");
     if (!prefix) return;
+    Tensor t = t_in.to(Device::CPU);
     std::string base = std::string(prefix) + "_trace_" + name;
     std::ofstream bin(base + ".bin", std::ios::binary);
     bin.write((const char*)t.ptr(), (std::streamsize)(t.numel() * sizeof(float)));
@@ -28,22 +28,10 @@ void trace(const char* name, const Tensor& t) {
 constexpr int kSeqMultiple = 32;  // SEQ_MULTI_OF: sequences are padded to this
 int64_t pad_to(int64_t n) { return (n + kSeqMultiple - 1) / kSeqMultiple * kSeqMultiple; }
 
-// y = x * scale (per row vector [dim]) in place
-void scale_rows_(Tensor& x, const float* scale, int64_t dim) {
-    const int64_t rows = x.numel() / dim;
-    for (int64_t r = 0; r < rows; ++r) {
-        float* p = x.ptr() + r * dim;
-        for (int64_t i = 0; i < dim; ++i) p[i] *= scale[i];
-    }
-}
-// x += gate (per row vector) * y
-void add_gated_(Tensor& x, const Tensor& y, const float* gate, int64_t dim) {
-    const int64_t rows = x.numel() / dim;
-    for (int64_t r = 0; r < rows; ++r) {
-        float* p = x.ptr() + r * dim;
-        const float* q = y.ptr() + r * dim;
-        for (int64_t i = 0; i < dim; ++i) p[i] += gate[i] * q[i];
-    }
+// Appends `n_pad` copies of the [1, D] pad token to rows [n, D].
+Tensor pad_rows(const Tensor& rows, const Tensor& pad, int64_t n_pad) {
+    if (n_pad <= 0) return rows;
+    return concat_batch(rows, repeat_batch(pad, n_pad));
 }
 }  // namespace
 
@@ -102,20 +90,26 @@ void ZImageTransformer::rope_tables(const std::vector<std::array<int, 3>>& pos, 
 void ZImageTransformer::run_block(const Block& b, Tensor& x, const Tensor& cos, const Tensor& sin,
                                   const Tensor* adaln) const {
     const int64_t D = dim_;
-    std::vector<float> scale_msa(D, 1.0f), gate_msa(D, 1.0f), scale_mlp(D, 1.0f), gate_mlp(D, 1.0f);
+    // Modulation vectors: tiny, so computed on the CPU and sent to x's device.
+    Tensor scale_msa, gate_msa, scale_mlp, gate_mlp;
     if (b.adaln.valid()) {
-        Tensor mod = b.adaln(*adaln);  // [1, 4D]: scale_msa, gate_msa, scale_mlp, gate_mlp
+        Tensor mod = b.adaln(*adaln).to(Device::CPU);  // [1, 4D]: scale_msa, gate_msa, scale_mlp, gate_mlp
         const float* m = mod.ptr();
+        Tensor sm({D}), gm({D}), sf({D}), gf({D});
         for (int64_t i = 0; i < D; ++i) {
-            scale_msa[i] = 1.0f + m[i];
-            gate_msa[i] = std::tanh(m[D + i]);
-            scale_mlp[i] = 1.0f + m[2 * D + i];
-            gate_mlp[i] = std::tanh(m[3 * D + i]);
+            sm.ptr()[i] = 1.0f + m[i];
+            gm.ptr()[i] = std::tanh(m[D + i]);
+            sf.ptr()[i] = 1.0f + m[2 * D + i];
+            gf.ptr()[i] = std::tanh(m[3 * D + i]);
         }
+        scale_msa = sm.to(x.device);
+        gate_msa = gm.to(x.device);
+        scale_mlp = sf.to(x.device);
+        gate_mlp = gf.to(x.device);
     }
     // attention
     Tensor h = rms_norm(x, b.attn_norm1, cfg_.norm_eps);
-    if (b.adaln.valid()) scale_rows_(h, scale_msa.data(), D);
+    if (b.adaln.valid()) mul_rows_(h, scale_msa);
     Tensor q = b.to_q(h), k = b.to_k(h), v = b.to_v(h);
     rms_norm_heads_(q, head_dim_, b.norm_q, 1e-5f);
     rms_norm_heads_(k, head_dim_, b.norm_k, 1e-5f);
@@ -124,16 +118,16 @@ void ZImageTransformer::run_block(const Block& b, Tensor& x, const Tensor& cos, 
     Tensor a = b.to_out(attention(q, k, v, cfg_.heads, false));
     a = rms_norm(a, b.attn_norm2, cfg_.norm_eps);
     if (b.adaln.valid())
-        add_gated_(x, a, gate_msa.data(), D);
+        add_rows_scaled_(x, a, gate_msa);
     else
         add_(x, a);
     // feed-forward
     h = rms_norm(x, b.ffn_norm1, cfg_.norm_eps);
-    if (b.adaln.valid()) scale_rows_(h, scale_mlp.data(), D);
+    if (b.adaln.valid()) mul_rows_(h, scale_mlp);
     Tensor f = b.w2(swiglu(b.w1(h), b.w3(h)));
     f = rms_norm(f, b.ffn_norm2, cfg_.norm_eps);
     if (b.adaln.valid())
-        add_gated_(x, f, gate_mlp.data(), D);
+        add_rows_scaled_(x, f, gate_mlp);
     else
         add_(x, f);
 }
@@ -144,6 +138,8 @@ Tensor ZImageTransformer::forward(const Tensor& x_in, float t, const Tensor& cap
     if (C != in_channels_ || H % p || W % p) throw std::runtime_error("Z-Image: bad latent shape " + x_in.shape_str());
     const int64_t Ht = H / p, Wt = W / p, n_img = Ht * Wt, n_img_pad = pad_to(n_img);
     const int64_t n_cap = cap_in.dim(1), n_cap_pad = pad_to(n_cap);
+    const Device dev = x_in.device;
+    if (cap_in.device != dev) throw std::runtime_error("Z-Image: latent and text on different devices");
 
     // 1. timestep embedding -> adaln [1, 256]
     Tensor adaln;
@@ -156,35 +152,23 @@ Tensor ZImageTransformer::forward(const Tensor& x_in, float t, const Tensor& cap
             freq.ptr()[i] = std::cos(tt * f);
             freq.ptr()[half + i] = std::sin(tt * f);
         }
-        adaln = t_mlp0_(freq);
+        adaln = t_mlp0_(freq.to(dev));
         silu_(adaln);
         adaln = t_mlp2_(adaln);
         trace("adaln", adaln);
     }
 
     // 2. image tokens: patchify (features ordered ph, pw, c), embed, pad
-    Tensor patches({n_img, p * p * C});
-    for (int64_t h = 0; h < Ht; ++h)
-        for (int64_t w = 0; w < Wt; ++w) {
-            float* tok = patches.ptr() + (h * Wt + w) * p * p * C;
-            for (int64_t ph = 0; ph < p; ++ph)
-                for (int64_t pw = 0; pw < p; ++pw)
-                    for (int64_t c = 0; c < C; ++c)
-                        tok[(ph * p + pw) * C + c] = x_in.ptr()[(c * H + h * p + ph) * W + w * p + pw];
-        }
-    Tensor img = x_embed_(patches);  // [n_img, D]
+    Tensor img = x_embed_(patchify2d(x_in, (int)p));  // [n_img, D]
     trace("x_embed", img);
-    Tensor img_seq({1, n_img_pad, D});
-    std::memcpy(img_seq.ptr(), img.ptr(), (size_t)(n_img * D) * sizeof(float));
-    for (int64_t i = n_img; i < n_img_pad; ++i)
-        for (int64_t j = 0; j < D; ++j) img_seq.ptr()[i * D + j] = x_pad_->at(j);
+    Tensor img_seq = pad_rows(img, *x_pad_, n_img_pad - n_img);
+    img_seq.reshape({1, n_img_pad, D});
 
     // 3. text tokens: RMSNorm, embed, pad
     Tensor cap = cap_embed_(rms_norm(cap_in, cap_norm_, cfg_.norm_eps));  // [1, n_cap, D]
-    Tensor cap_seq({1, n_cap_pad, D});
-    std::memcpy(cap_seq.ptr(), cap.ptr(), (size_t)(n_cap * D) * sizeof(float));
-    for (int64_t i = n_cap; i < n_cap_pad; ++i)
-        for (int64_t j = 0; j < D; ++j) cap_seq.ptr()[i * D + j] = cap_pad_->at(j);
+    cap.reshape({n_cap, D});
+    Tensor cap_seq = pad_rows(cap, *cap_pad_, n_cap_pad - n_cap);
+    cap_seq.reshape({1, n_cap_pad, D});
 
     // rotary positions: text (1 + i, 0, 0) for every row including its pad
     // rows (the reference builds the text grid over the padded length);
@@ -196,6 +180,10 @@ Tensor ZImageTransformer::forward(const Tensor& x_in, float t, const Tensor& cap
     Tensor img_cos, img_sin, cap_cos, cap_sin;
     rope_tables(img_pos, img_cos, img_sin);
     rope_tables(cap_pos, cap_cos, cap_sin);
+    img_cos = img_cos.to(dev);
+    img_sin = img_sin.to(dev);
+    cap_cos = cap_cos.to(dev);
+    cap_sin = cap_sin.to(dev);
 
     trace("cap_embed", cap);
     // refiners
@@ -214,6 +202,8 @@ Tensor ZImageTransformer::forward(const Tensor& x_in, float t, const Tensor& cap
     uni_pos.insert(uni_pos.end(), cap_pos.begin(), cap_pos.end());
     Tensor uni_cos, uni_sin;
     rope_tables(uni_pos, uni_cos, uni_sin);
+    uni_cos = uni_cos.to(dev);
+    uni_sin = uni_sin.to(dev);
     for (size_t i = 0; i < layers_.size(); ++i) {
         run_block(layers_[i], uni, uni_cos, uni_sin, &adaln);
         if (i == 0) trace("layer0", uni);
@@ -221,26 +211,17 @@ Tensor ZImageTransformer::forward(const Tensor& x_in, float t, const Tensor& cap
     trace("layers_out", uni);
 
     // 5. final layer on the image tokens, unpatchify
-    Tensor img_out({n_img, D});
-    std::memcpy(img_out.ptr(), uni.ptr(), (size_t)(n_img * D) * sizeof(float));
+    Tensor img_out = slice_rows(uni, 0, n_img);
     Tensor c = adaln;
     silu_(c);
     Tensor scale = final_adaln_(c);  // [1, D]
+    affine_(scale, 1.0f, 1.0f);      // 1 + scale
+    scale.reshape({D});
     img_out = layer_norm(img_out, nullptr, nullptr, 1e-6f);
-    for (int64_t i = 0; i < D; ++i) scale.ptr()[i] += 1.0f;
-    scale_rows_(img_out, scale.ptr(), D);
+    mul_rows_(img_out, scale);
     Tensor out_tok = final_linear_(img_out);  // [n_img, p*p*C]
     trace("final", out_tok);
-    Tensor out({1, C, H, W});
-    for (int64_t h = 0; h < Ht; ++h)
-        for (int64_t w = 0; w < Wt; ++w) {
-            const float* tok = out_tok.ptr() + (h * Wt + w) * p * p * C;
-            for (int64_t ph = 0; ph < p; ++ph)
-                for (int64_t pw = 0; pw < p; ++pw)
-                    for (int64_t cc = 0; cc < C; ++cc)
-                        out.ptr()[(cc * H + h * p + ph) * W + w * p + pw] = tok[(ph * p + pw) * C + cc];
-        }
-    return out;
+    return unpatchify2d(out_tok, C, H, W, (int)p);
 }
 
 }  // namespace sd

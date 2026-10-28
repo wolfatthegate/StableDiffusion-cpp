@@ -35,7 +35,7 @@ VAEDecoder::VAEDecoder(const Weights& w, float scaling_factor, float shift_facto
 Tensor VAEDecoder::decode(const Tensor& latents) const {
     // Undo the training-time latent scaling: z / scale + shift.
     Tensor z = latents;
-    for (float& v : z.data) v = v / scaling_factor_ + shift_factor_;
+    affine_(z, 1.0f / scaling_factor_, shift_factor_);
     Tensor h = conv_in_(post_quant_.valid() ? post_quant_(z) : z);
     h = mid_res0_->forward(h, nullptr);
     h = mid_attn_->forward(h);

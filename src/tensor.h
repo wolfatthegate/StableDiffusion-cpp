@@ -13,15 +13,28 @@
 //   * All heavy work funnels into gemm_nt(), so it is the single place to
 //     optimise (or replace with a BLAS, see USE_ACCELERATE).
 //   * Parallelism comes from one global thread pool (parallel_for).
+//   * A Tensor may live on the GPU (Device::CUDA). Every op then runs the
+//     CUDA implementation from backend_cuda.h and returns a GPU tensor; ops
+//     never mix devices. to(Device) copies across. The CPU path is unchanged
+//     and is the only one on machines without CUDA.
 // ============================================================================
 #pragma once
 
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <string>
 #include <vector>
 
 namespace sd {
+
+// Where a tensor's memory lives.
+enum class Device { CPU, CUDA };
+const char* device_name(Device d);          // "cpu" / "cuda"
+Device parse_device(const std::string& s);  // "cpu", "cuda", or "auto" (cuda if available)
+
+// Owns one GPU allocation (defined in tensor.cpp).
+struct DeviceBuffer;
 
 // Dense, contiguous, row-major float32 tensor.
 //
@@ -34,18 +47,32 @@ enum class DType { F32, BF16 };
 
 struct Tensor {
     std::vector<int64_t> shape;   // size of each dimension, outermost first
-    std::vector<float> data;      // F32 storage: numel() elements, row-major
-    std::vector<uint16_t> data16; // BF16 storage, used when dtype == BF16
+    std::vector<float> data;      // F32 host storage: numel() elements, row-major
+    std::vector<uint16_t> data16; // BF16 host storage, used when dtype == BF16
     DType dtype = DType::F32;
+    Device device = Device::CPU;
+    std::shared_ptr<DeviceBuffer> dev;  // GPU storage when device == CUDA (host vectors are then empty)
 
     Tensor() = default;
-    // Allocates a zero-filled F32 tensor of the given shape.
+    // Allocates a zero-filled F32 tensor of the given shape on the CPU.
     explicit Tensor(std::vector<int64_t> s) : shape(std::move(s)), data(numel_of(shape), 0.0f) {}
+    // Allocates a zero-filled F32 tensor on the given device.
+    Tensor(std::vector<int64_t> s, Device d);
 
     // Product of all dimensions (1 for an empty shape).
     static int64_t numel_of(const std::vector<int64_t>& s);
-    int64_t numel() const { return dtype == DType::F32 ? (int64_t)data.size() : (int64_t)data16.size(); }
+    int64_t numel() const {
+        if (device == Device::CUDA) return numel_of(shape);
+        return dtype == DType::F32 ? (int64_t)data.size() : (int64_t)data16.size();
+    }
     bool is_bf16() const { return dtype == DType::BF16; }
+    bool is_cuda() const { return device == Device::CUDA; }
+    // Copies the tensor to a device (a plain copy when already there).
+    Tensor to(Device d) const;
+    // Device memory pointers (CUDA tensors only).
+    float* dptr();
+    const float* dptr() const;
+    const uint16_t* dptr16() const;
     // Converts BF16 storage to F32 in place (no-op for F32).
     void to_f32();
     // Converts F32 storage to BF16 in place (rounds to nearest even).
@@ -55,10 +82,11 @@ struct Tensor {
     int ndim() const { return (int)shape.size(); }
     // Size of dimension i; negative i counts from the end (dim(-1) = last).
     int64_t dim(int i) const { return shape[i < 0 ? i + ndim() : i]; }
-    float* ptr() { return data.data(); }              // F32 only
-    const float* ptr() const { return data.data(); }  // F32 only
-    const uint16_t* ptr16() const { return data16.data(); }
+    float* ptr() { check_host(); return data.data(); }              // F32, CPU only
+    const float* ptr() const { check_host(); return data.data(); }  // F32, CPU only
+    const uint16_t* ptr16() const { check_host(); return data16.data(); }
     bool empty() const { return numel() == 0; }
+    void check_host() const;  // throws if the tensor is on the GPU
     // Changes the shape in place without moving data. Throws if the element
     // count differs.
     Tensor& reshape(std::vector<int64_t> s);
@@ -161,6 +189,18 @@ void rope_(Tensor& x, int64_t dim, const Tensor& cos, const Tensor& sin, bool in
 
 // SwiGLU: silu(gate) * up, elementwise, same shapes.
 Tensor swiglu(const Tensor& gate, const Tensor& up);
+
+// Row-vector helpers, all in place. Rows are the leading dimensions of x
+// flattened; dim is x's last dimension.
+void affine_(Tensor& x, float a, float b);                         // x = x * a + b
+void mul_rows_(Tensor& x, const Tensor& v);                        // x[r, :] *= v  (v has dim elements)
+void add_rows_scaled_(Tensor& x, const Tensor& y, const Tensor& g); // x[r, :] += g * y[r, :]
+void add_channel_bias_(Tensor& x, const Tensor& b);                // x [N,C,H,W] += b [N,C] per channel
+// [1, C, H, W] -> [(H/p)*(W/p), p*p*C] with features ordered (ph, pw, c), and back.
+Tensor patchify2d(const Tensor& x, int p);
+Tensor unpatchify2d(const Tensor& tokens, int64_t C, int64_t H, int64_t W, int p);
+// Rows [from, to) of x viewed as [rows, last dim] -> [to - from, last dim].
+Tensor slice_rows(const Tensor& x, int64_t from, int64_t to);
 
 // Multi-head scaled dot-product attention.
 //   q: [N, Sq, heads*d]   k, v: [N, Skv, kv_heads*d]   ->   [N, Sq, heads*d]

@@ -10,6 +10,7 @@
 #include <cstdio>
 #include <random>
 
+#include "backend_cuda.h"
 #include "tensor.h"
 
 using namespace sd;
@@ -298,6 +299,148 @@ static void bench_gemm_bf16() {
     std::printf("gemm_bf16 %dx%dx%d: %.1f ms  %.1f GFLOP/s\n", M, N, K, s * 1e3, 2.0 * M * N * K / s / 1e9);
 }
 
+// ---------------------------------------------------------------------------
+// CUDA backend: every op is run on the CPU and on the GPU with the same
+// inputs and the results compared. Skipped when no CUDA device is available.
+// ---------------------------------------------------------------------------
+static Tensor randn_t(std::vector<int64_t> shape, std::mt19937& rng) {
+    Tensor t(std::move(shape));
+    fill(t.data, rng);
+    return t;
+}
+
+static double max_diff(const Tensor& a, const Tensor& b_any) {
+    Tensor b = b_any.to(Device::CPU);
+    if (a.numel() != b.numel()) return 1e30;
+    double err = 0;
+    for (int64_t i = 0; i < a.numel(); ++i) err = std::max(err, (double)std::fabs(a.ptr()[i] - b.ptr()[i]));
+    return err;
+}
+
+static void cuda_check(const char* name, const Tensor& cpu, const Tensor& gpu, double tol) {
+    char label[64];
+    std::snprintf(label, sizeof label, "cuda %s", name);
+    check(label, max_diff(cpu, gpu), tol);
+}
+
+static void test_cuda(std::mt19937& rng) {
+    if (!cuda::available()) {
+        std::printf("cuda: not available, GPU comparisons skipped\n");
+        return;
+    }
+    std::printf("cuda: %s\n", cuda::device_name());
+    const Device G = Device::CUDA;
+
+    // round trip
+    {
+        Tensor x = randn_t({3, 70}, rng);
+        cuda_check("to(cuda).to(cpu)", x, x.to(G), 0.0);
+    }
+    // linear, f32 and bf16 weights, with bias
+    {
+        Tensor x = randn_t({2, 37, 300}, rng), W = randn_t({130, 300}, rng), b = randn_t({130}, rng);
+        Tensor y = linear(x, W, &b);
+        cuda_check("linear f32", y, linear(x.to(G), W.to(G), nullptr), 1e30);  // shape probe
+        Tensor bg = b.to(G);
+        cuda_check("linear f32 +bias", y, linear(x.to(G), W.to(G), &bg), 1e-3);
+        Tensor Wh = W;
+        Wh.to_bf16();
+        Tensor yh = linear(x, Wh, &b);
+        cuda_check("linear bf16 +bias", yh, linear(x.to(G), Wh.to(G), &bg), 3e-2);  // A is rounded to bf16 on the GPU
+    }
+    // conv2d
+    {
+        Tensor x = randn_t({2, 5, 9, 11}, rng), w = randn_t({6, 5, 3, 3}, rng), b = randn_t({6}, rng), bg = b.to(G);
+        cuda_check("conv2d k3 s1", conv2d(x, w, &b, 1, 1), conv2d(x.to(G), w.to(G), &bg, 1, 1), 1e-3);
+        cuda_check("conv2d k3 s2", conv2d(x, w, &b, 2, 1), conv2d(x.to(G), w.to(G), &bg, 2, 1), 1e-3);
+        Tensor w1 = randn_t({4, 5, 1, 1}, rng), b1 = randn_t({4}, rng), b1g = b1.to(G);
+        cuda_check("conv2d k1", conv2d(x, w1, &b1, 1, 0), conv2d(x.to(G), w1.to(G), &b1g, 1, 0), 1e-3);
+    }
+    // norms
+    {
+        Tensor x = randn_t({2, 64, 5, 7}, rng), g = randn_t({64}, rng), b = randn_t({64}, rng);
+        cuda_check("group_norm", group_norm(x, 32, g, b, 1e-6f), group_norm(x.to(G), 32, g.to(G), b.to(G), 1e-6f), 1e-4);
+        Tensor z = randn_t({3, 7, 64}, rng);
+        cuda_check("layer_norm", layer_norm(z, g, b, 1e-5f), layer_norm(z.to(G), g.to(G), b.to(G), 1e-5f), 1e-4);
+        cuda_check("layer_norm no affine", layer_norm(z, nullptr, nullptr, 1e-5f), layer_norm(z.to(G), nullptr, nullptr, 1e-5f), 1e-4);
+        Tensor gG = g.to(G);
+        cuda_check("rms_norm", rms_norm(z, &g, 1e-6f), rms_norm(z.to(G), &gG, 1e-6f), 1e-4);
+        Tensor zh = z, zg = z.to(G), gd = randn_t({8}, rng), gdg = gd.to(G);
+        rms_norm_heads_(zh, 8, &gd, 1e-6f);
+        rms_norm_heads_(zg, 8, &gdg, 1e-6f);
+        cuda_check("rms_norm_heads_", zh, zg, 1e-4);
+    }
+    // rope (both conventions), swiglu, geglu, elementwise
+    {
+        const int S = 5, H = 3, D = 8;
+        Tensor x = randn_t({1, S, H * D}, rng), cs({S, D}), sn({S, D});
+        for (int s = 0; s < S; ++s)
+            for (int i = 0; i < D; ++i) {
+                cs.ptr()[s * D + i] = std::cos(0.1f * s * (i % (D / 2) + 1));
+                sn.ptr()[s * D + i] = std::sin(0.1f * s * (i % (D / 2) + 1));
+            }
+        for (bool inter : {false, true}) {
+            Tensor a = x, b = x.to(G);
+            rope_(a, D, cs, sn, inter);
+            rope_(b, D, cs.to(G), sn.to(G), inter);
+            cuda_check(inter ? "rope interleaved" : "rope rotate_half", a, b, 1e-5);
+        }
+        Tensor u = randn_t({1, S, H * D}, rng);
+        cuda_check("swiglu", swiglu(x, u), swiglu(x.to(G), u.to(G)), 1e-5);
+        Tensor gg = randn_t({6, 40}, rng);
+        cuda_check("geglu", geglu(gg), geglu(gg.to(G)), 1e-5);
+        for (int k = 0; k < 3; ++k) {
+            Tensor a = randn_t({1000}, rng), b = a.to(G);
+            if (k == 0) { silu_(a); silu_(b); }
+            if (k == 1) { gelu_(a); gelu_(b); }
+            if (k == 2) { quick_gelu_(a); quick_gelu_(b); }
+            cuda_check(k == 0 ? "silu_" : k == 1 ? "gelu_" : "quick_gelu_", a, b, 1e-5);
+        }
+        Tensor a = randn_t({1000}, rng), b = randn_t({1000}, rng), ag = a.to(G);
+        add_(a, b); add_(ag, b.to(G));
+        cuda_check("add_", a, ag, 1e-6);
+        scale_(a, 0.37f); scale_(ag, 0.37f);
+        cuda_check("scale_", a, ag, 1e-6);
+        affine_(a, 1.5f, -0.25f); affine_(ag, 1.5f, -0.25f);
+        cuda_check("affine_", a, ag, 1e-5);
+    }
+    // attention: MHA, GQA, causal
+    {
+        Tensor q = randn_t({2, 9, 24}, rng), k = randn_t({2, 9, 24}, rng), v = randn_t({2, 9, 24}, rng);
+        cuda_check("attention h3", attention(q, k, v, 3), attention(q.to(G), k.to(G), v.to(G), 3), 1e-4);
+        cuda_check("attention h3 causal", attention(q, k, v, 3, true), attention(q.to(G), k.to(G), v.to(G), 3, true), 1e-4);
+        Tensor kk = randn_t({2, 9, 8}, rng), vv = randn_t({2, 9, 8}, rng);
+        cuda_check("attention gqa", attention(q, kk, vv, 3, false, 1), attention(q.to(G), kk.to(G), vv.to(G), 3, false, 1), 1e-4);
+        Tensor qb = randn_t({1, 100, 64}, rng), kb = randn_t({1, 100, 64}, rng), vb = randn_t({1, 100, 64}, rng);
+        cuda_check("attention 100 tokens", attention(qb, kb, vb, 2), attention(qb.to(G), kb.to(G), vb.to(G), 2), 1e-4);
+    }
+    // row helpers and shape ops
+    {
+        Tensor x = randn_t({4, 6}, rng), v = randn_t({6}, rng), y = randn_t({4, 6}, rng);
+        Tensor xg = x.to(G);
+        mul_rows_(x, v); mul_rows_(xg, v.to(G));
+        cuda_check("mul_rows_", x, xg, 1e-6);
+        add_rows_scaled_(x, y, v); add_rows_scaled_(xg, y.to(G), v.to(G));
+        cuda_check("add_rows_scaled_", x, xg, 1e-6);
+        Tensor img = randn_t({2, 3, 4, 5}, rng), bias = randn_t({2, 3}, rng), imgg = img.to(G);
+        add_channel_bias_(img, bias); add_channel_bias_(imgg, bias.to(G));
+        cuda_check("add_channel_bias_", img, imgg, 1e-6);
+        cuda_check("upsample_nearest2x", upsample_nearest2x(img), upsample_nearest2x(img.to(G)), 0.0);
+        Tensor img2 = randn_t({2, 2, 4, 5}, rng);
+        cuda_check("concat_channels", concat_channels(img, img2), concat_channels(img.to(G), img2.to(G)), 0.0);
+        cuda_check("concat_batch", concat_batch(img, img2), concat_batch(img.to(G), img2.to(G)), 0.0);
+        cuda_check("nchw_to_nlc", nchw_to_nlc(img), nchw_to_nlc(img.to(G)), 0.0);
+        cuda_check("nlc_to_nchw", nlc_to_nchw(nchw_to_nlc(img), 4, 5), nlc_to_nchw(nchw_to_nlc(img.to(G)), 4, 5), 0.0);
+        cuda_check("slice_batch", slice_batch(img, 1), slice_batch(img.to(G), 1), 0.0);
+        cuda_check("repeat_batch", repeat_batch(img, 3), repeat_batch(img.to(G), 3), 0.0);
+        cuda_check("slice_rows", slice_rows(x, 1, 3), slice_rows(xg, 1, 3), 0.0);
+        Tensor lat = randn_t({1, 16, 6, 8}, rng);
+        cuda_check("patchify2d", patchify2d(lat, 2), patchify2d(lat.to(G), 2), 0.0);
+        Tensor tok = patchify2d(lat, 2);
+        cuda_check("unpatchify2d", unpatchify2d(tok, 16, 6, 8, 2), unpatchify2d(tok.to(G), 16, 6, 8, 2), 0.0);
+    }
+}
+
 int main() {
     std::mt19937 rng(1234);
     test_gemm(rng, 4, 4, 4, false, false);
@@ -317,6 +460,7 @@ int main() {
     test_gemm_bf16(rng, 130, 257, 300);
     test_rms_rope_swiglu(rng);
     test_gqa(rng);
+    test_cuda(rng);
     bench_gemm();
     bench_gemm_bf16();
     std::printf(failures ? "\n%d FAILED\n" : "\nall ok\n", failures);

@@ -192,6 +192,13 @@ void Weights::load_model(const std::string& dir, const std::string& base, bool k
     }
 }
 
+void Weights::to_device(Device d) {
+    for (auto& kv : tensors) {
+        if (kv.second.device == d) continue;
+        kv.second = kv.second.to(d);
+    }
+}
+
 const Tensor& Weights::get(const std::string& name) const {
     auto it = tensors.find(name);
     if (it == tensors.end()) throw std::runtime_error("missing weight: " + name);

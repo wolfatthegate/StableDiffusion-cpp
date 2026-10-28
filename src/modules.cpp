@@ -36,16 +36,7 @@ Tensor ResnetBlock::forward(const Tensor& x, const Tensor* temb) const {
     h = conv1(h);
     // Time conditioning: project the embedding to C channels and add the
     // same value to every pixel of that channel.
-    if (temb_proj.valid() && temb) {
-        Tensor t = temb_proj(*temb);  // [N, C]
-        const int64_t N = h.dim(0), C = h.dim(1), HW = h.dim(2) * h.dim(3);
-        for (int64_t n = 0; n < N; ++n)
-            for (int64_t c = 0; c < C; ++c) {
-                const float add = t.ptr()[n * C + c];
-                float* p = h.ptr() + (n * C + c) * HW;
-                for (int64_t i = 0; i < HW; ++i) p[i] += add;
-            }
-    }
+    if (temb_proj.valid() && temb) add_channel_bias_(h, temb_proj(*temb));  // [N, C] per channel
     h = norm2(h);
     silu_(h);
     h = conv2(h);
