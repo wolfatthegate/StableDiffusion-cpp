@@ -71,7 +71,7 @@ Tensor UNet::time_embedding(float t, int64_t N) const {
         e.ptr()[i] = std::cos(arg);
         e.ptr()[half + i] = std::sin(arg);
     }
-    Tensor h = time1_(e);
+    Tensor h = time1_(e.to(time1_.W->device));
     silu_(h);
     h = time2_(h);
     silu_(h);

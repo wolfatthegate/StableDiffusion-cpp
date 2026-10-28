@@ -329,6 +329,7 @@ std::string read_file(const std::string& path) {
 
 struct Options {
     std::string model_dir = "models/sd15";
+    std::string device = "auto";
     std::string host = "127.0.0.1";
     std::string web_dir = "web";
     int port = 8080;
@@ -342,7 +343,8 @@ void usage() {
                  "  --host ADDR       bind address (default 127.0.0.1; 0.0.0.0 for the LAN)\n"
                  "  --port N          TCP port (default 8080)\n"
                  "  --web-dir DIR     directory holding index.html (default web)\n"
-                 "  --threads N       worker threads (default: all cores)\n");
+                 "  --threads N       worker threads (default: all cores)\n"
+                 "  --device NAME     cpu | cuda | auto (default auto)\n");
 }
 
 }  // namespace
@@ -363,6 +365,7 @@ int main(int argc, char** argv) try {
         else if (a == "--port" || a == "-p") opt.port = std::atoi(need().c_str());
         else if (a == "--web-dir") opt.web_dir = need();
         else if (a == "--threads" || a == "-t") opt.threads = std::atoi(need().c_str());
+        else if (a == "--device") opt.device = need();
         else {
             usage();
             std::exit(a == "--help" || a == "-h" ? 0 : 2);
@@ -370,9 +373,10 @@ int main(int argc, char** argv) try {
     }
     if (opt.threads > 0) set_num_threads(opt.threads);
 
-    std::fprintf(stderr, "loading %s ...\n", opt.model_dir.c_str());
-    Pipeline pipe(opt.model_dir);
-    std::fprintf(stderr, "loaded (unet %.0fM params), %d threads\n", pipe.unet_params() / 1e6, num_threads());
+    const Device device = parse_device(opt.device);
+    std::fprintf(stderr, "loading %s on %s ...\n", opt.model_dir.c_str(), device_name(device));
+    Pipeline pipe(opt.model_dir, device);
+    std::fprintf(stderr, "loaded (generator %.0fM params), %d threads\n", pipe.generator_params() / 1e6, num_threads());
     JobQueue queue(pipe);
 
     http::Server server(opt.host, opt.port);
@@ -390,7 +394,7 @@ int main(int argc, char** argv) try {
         const GenerateParams d = pipe.defaults();
         std::ostringstream js;
         js << "{\"model_dir\":" << json_quote(pipe.model_dir()) << ",\"family\":" << json_quote(pipe.family_name())
-           << ",\"threads\":" << num_threads() << ",\"queue\":" << queue.pending()
+           << ",\"device\":" << json_quote(device_name(pipe.device())) << ",\"threads\":" << num_threads() << ",\"queue\":" << queue.pending()
            << ",\"busy\":" << (queue.busy() ? "true" : "false") << ",\"current\":" << json_quote(queue.current())
            << ",\"defaults\":{\"steps\":" << d.steps << ",\"cfg\":" << d.cfg << ",\"width\":" << d.width
            << ",\"height\":" << d.height << ",\"sampler\":" << json_quote(d.sampler) << "},\"samplers\":[";

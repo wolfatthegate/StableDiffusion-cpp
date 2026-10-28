@@ -3,6 +3,7 @@
 #   make test         build and run the kernel tests (no weights needed)
 #   make test_tokenizer && ./test_tokenizer   tokenizer test (needs models/sd15)
 #   make ACCELERATE=0 use the built-in GEMM instead of Apple's BLAS (macOS defaults to 1)
+#   make CUDA=1       add the NVIDIA GPU backend (needs nvcc; CUDA_ARCH=sm_86 to pin an architecture)
 #   make clean
 # Every source in src/ except main.cpp and server.cpp is shared by the
 # binaries and the tests.
@@ -29,8 +30,22 @@ ifeq ($(ACCELERATE),1)
   LDFLAGS  += -framework Accelerate
 endif
 
-LIB_SRCS := $(filter-out src/main.cpp src/server.cpp,$(wildcard src/*.cpp))
-LIB_OBJS := $(LIB_SRCS:src/%.cpp=build/%.o)
+# CUDA backend: compiled by nvcc from src/backend_cuda.cu; without it the
+# stub src/backend_cuda_stub.cpp is linked and every op runs on the CPU.
+ifeq ($(CUDA),1)
+  NVCC      ?= nvcc
+  CUDA_HOME ?= /usr/local/cuda
+  CUDA_ARCH ?= native
+  NVCCFLAGS ?= -O3 -std=c++17 -arch=$(CUDA_ARCH) -Xcompiler -fPIC
+  CXXFLAGS  += -DUSE_CUDA -I$(CUDA_HOME)/include
+  LDFLAGS   += -L$(CUDA_HOME)/lib64 -lcudart -lcublas
+  LIB_SRCS  := $(filter-out src/main.cpp src/server.cpp src/backend_cuda_stub.cpp,$(wildcard src/*.cpp))
+  CUDA_OBJS := build/backend_cuda.o
+else
+  LIB_SRCS  := $(filter-out src/main.cpp src/server.cpp,$(wildcard src/*.cpp))
+  CUDA_OBJS :=
+endif
+LIB_OBJS := $(LIB_SRCS:src/%.cpp=build/%.o) $(CUDA_OBJS)
 HEADERS  := $(wildcard src/*.h)
 
 all: sd sd-server
@@ -51,6 +66,9 @@ test: test_ops
 # project this size.
 build/%.o: src/%.cpp $(HEADERS) | build
 	$(CXX) $(CXXFLAGS) -c -o $@ $<
+
+build/backend_cuda.o: src/backend_cuda.cu $(HEADERS) | build
+	$(NVCC) $(NVCCFLAGS) -c -o $@ $<
 
 build/test_ops.o: tests/test_ops.cpp $(HEADERS) | build
 	$(CXX) $(CXXFLAGS) -Isrc -c -o $@ $<
@@ -92,3 +110,10 @@ test_zimage: $(LIB_OBJS) build/test_zimage.o
 
 build/test_zimage.o: tests/test_zimage.cpp $(HEADERS) | build
 	$(CXX) $(CXXFLAGS) -Isrc -c -o $@ $<
+
+# Parses src/backend_cuda.cu with clang and stand-in headers, for machines
+# without the CUDA toolkit. Catches syntax and type errors, not GPU bugs.
+cuda-syntax-check:
+	clang++ -x cuda --cuda-host-only -nocudainc -nocudalib -std=c++17 -Isrc -Itests/cuda_stub -fsyntax-only src/backend_cuda.cu && echo "backend_cuda.cu parses"
+
+.PHONY: cuda-syntax-check

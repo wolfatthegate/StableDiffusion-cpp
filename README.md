@@ -26,8 +26,11 @@ pipeline is implemented in `src/`:
 
 On macOS the GEMM goes through Apple's Accelerate framework by default
 (`make ACCELERATE=0` keeps everything hand-written); every other platform
-uses the built-in kernel. Weights are read in the standard Hugging Face
-diffusers layout, so fine-tunes of either family load unchanged.
+uses the built-in kernel. On machines with an NVIDIA GPU, `make CUDA=1`
+adds a CUDA backend that runs the image generator and the VAE on the GPU
+(see [GPU acceleration](#gpu-acceleration)). Weights are read in the
+standard Hugging Face diffusers layout, so fine-tunes of either family load
+unchanged.
 
 Beside the command-line tool there is a **web interface** (`./sd-server`,
 also dependency-free) that shows the image emerging step by step while it is
@@ -104,6 +107,7 @@ Build options:
 | option | effect |
 |---|---|
 | `make ACCELERATE=0` | macOS: use the built-in GEMM instead of Apple's Accelerate BLAS (the default on macOS, 2.6x faster for Z-Image). Elsewhere the built-in kernel is always used. |
+| `make CUDA=1` | Build the NVIDIA GPU backend with `nvcc` (needs the CUDA toolkit; `CUDA_HOME` and `CUDA_ARCH=sm_86` override the defaults `/usr/local/cuda` and `native`). The binaries then pick the GPU automatically. |
 | `CXX=g++ make` | use a different compiler |
 | `CXXFLAGS="..." make` | replace the default `-std=c++17 -O3 -Wall -Wextra -pthread` |
 
@@ -168,7 +172,8 @@ diffusers conversion script, because the tensor names differ.
 | `--height` | `-H` | 512 (SD), 1024 (Z-Image) | image height; multiple of 64 |
 | `--seed` | `-s` | 42 | seed for the initial noise; `-1` picks a random one and prints it |
 | `--sampler` | | `euler` (SD), `flow` (Z-Image) | `euler` or `ddim` for SD 1.x; `flow` for Z-Image |
-| `--threads` | `-t` | all cores | worker threads |
+| `--threads` | `-t` | all cores | worker threads (CPU path) |
+| `--device` | | `auto` | `cpu`, `cuda`, or `auto` (the GPU when built with `CUDA=1` and one is present) |
 | `--output` | `-o` | `output.png` | output PNG path |
 | `--help` | `-h` | | print usage |
 
@@ -244,6 +249,45 @@ curl -o fox.png localhost:8080/api/jobs/<id>/image.png
 curl -X DELETE localhost:8080/api/jobs/<id>                           # forget a finished job and its image
 ```
 
+## GPU acceleration
+
+```sh
+make CUDA=1 -j                 # needs nvcc; links cudart and cublas
+./test_ops                     # now also compares every op on the GPU with the CPU result
+./sd --model-dir models/z-image-turbo --prompt "..."       # uses the GPU (--device cpu to compare)
+```
+
+With `CUDA=1`, every tensor operation has a GPU implementation in
+[src/backend_cuda.cu](src/backend_cuda.cu): matrix products through cuBLAS
+(bf16 tensor cores for the bf16 weights, float32 otherwise), and plain
+kernels for convolution (im2col), attention, the normalisations, rotary
+embeddings, activations and reshapes. The CPU code is untouched; a tensor
+carries a device, each op dispatches on it, and `--device cpu` runs the
+same binary without the GPU.
+
+What runs where: the image generator (UNet or Z-Image transformer) and the
+VAE decoder live on the GPU with their weights resident (3.4 GB for SD 1.5,
+12.3 GB bf16 for Z-Image). The text encoders stay on the CPU, since they take
+well under a second per prompt and would cost 8 GB of GPU memory. Only the
+latent (at most 1 MB) crosses the bus each step, so the sampler and the live
+previews work as before.
+
+Expectations: the two heavy workloads are GEMM and attention, which is what
+GPUs do best. On a card in the RTX 3080 to 4090 class, a Z-Image step should
+take about one second at 1024x1024 against 38 seconds on the M1 Max CPU; the
+first step includes cuBLAS warm-up. A 16 GB card fits Z-Image at 1024x1024;
+8 GB fits SD 1.5. `SD_CUDA_TF32=1` allows TF32 tensor cores for the float32
+products (SD 1.5), roughly twice as fast with about 1e-3 relative error.
+
+Validation: `./test_ops` runs every op on both devices with the same inputs
+and prints `cuda <op>  max|err|` lines; `./test_zimage --device` is not
+needed, since generating with and without `--device cpu` from the same seed
+should give images that differ only by float rounding. The backend was
+written and parse-checked without an NVIDIA GPU at hand (`make
+cuda-syntax-check` runs that check with clang), so the first run on real
+hardware is the acceptance test. If an op fails there, its kernel is a few
+lines in `backend_cuda.cu` next to the CPU version it must match.
+
 ## Fine-tuning
 
 The C++ code only runs models. To change what a model draws, train in
@@ -316,13 +360,14 @@ these levels.
 
 ```
 src/
-  pipeline.h / .cpp      Pipeline: model family detection, models kept in memory, generate()
+  backend_cuda.h / .cu   GPU implementations of every op (cuBLAS + kernels); backend_cuda_stub.cpp without CUDA
+  pipeline.h / .cpp      Pipeline: model family detection, device choice, models kept in memory, generate()
   zimage.h / .cpp        Z-Image single-stream diffusion transformer (S3-DiT)
   qwen3.h / .cpp         Qwen3 decoder-only language model, used as the Z-Image text encoder
   qwen_tokenizer.h/.cpp  Qwen byte-level BPE tokenizer with the chat template
   http.h / .cpp          minimal HTTP/1.1 server with streamed responses
   server.cpp             sd-server: JSON API, job queue, live previews
-  tensor.h / .cpp        Tensor type (f32 / bf16), thread pool, GEMM, and every operator
+  tensor.h / .cpp        Tensor type (f32 / bf16, CPU or CUDA), thread pool, GEMM, every operator with device dispatch
   json.h / .cpp          minimal JSON parser
   safetensors.h / .cpp   weight file loader with F16/BF16 conversion
   tokenizer.h / .cpp     CLIP byte-level BPE tokenizer
@@ -722,8 +767,8 @@ pipeline has not been compared tensor by tensor against PyTorch.
 
 ## Limitations
 
-- CPU and float32 only; there is no GPU backend and no fp16 or quantised
-  compute.
+- Float32 activations everywhere; no fp16 or quantised compute. The CUDA
+  backend has not yet been run on real hardware (see GPU acceleration).
 - The CLIP pre-tokeniser treats every non-ASCII code point as a letter, and
   lower-casing only affects ASCII. The Qwen tokenizer classifies the common
   punctuation, symbol and emoji blocks and matches the reference on CJK
@@ -750,6 +795,8 @@ pipeline has not been compared tensor by tensor against PyTorch.
 | `concat_channels: [...] vs [...]` | Width or height is not a multiple of 64. |
 | Process is killed, or the machine swaps heavily, with Z-Image | It needs about 25 GB free. Close other large programs, or use SD 1.5. |
 | `Z-Image: ...` or `Qwen3: ...` errors at load | The directory is incomplete; rerun `scripts/download_zimage.sh`, which resumes. |
+| `CUDA requested but not available` | The binary was built without `CUDA=1`, or no NVIDIA device is visible; use `--device cpu` or rebuild. |
+| `CUDA error in cudaMalloc` | The GPU is out of memory; use a smaller size, SD 1.5, or close other GPU programs. |
 | `cannot open .../vocab.json` | The tokenizer files are missing from the model directory. |
 | Very slow generation | Check that `threads:` on the first line matches your core count, and that no other heavy process is running. |
 | `cannot bind 127.0.0.1:8080` | Another process uses the port; pass `--port`. |

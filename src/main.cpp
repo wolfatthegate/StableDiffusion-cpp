@@ -10,6 +10,7 @@
 #include <cstdlib>
 #include <string>
 
+#include "backend_cuda.h"
 #include "image.h"
 #include "pipeline.h"
 
@@ -21,6 +22,7 @@ namespace {
 struct Options {
     std::string model_dir = "models/sd15";
     std::string output = "output.png";
+    std::string device = "auto";
     GenerateParams gen;
     // Which fields were given on the command line; the rest take the
     // pipeline's family defaults (SD 1.x or Z-Image).
@@ -39,6 +41,7 @@ void usage() {
                  "  --seed N              RNG seed (default 42; -1 picks a random seed)\n"
                  "  --sampler NAME        euler | ddim for SD 1.x, flow for Z-Image\n"
                  "  --threads N           worker threads (default: all cores)\n"
+                 "  --device NAME         cpu | cuda | auto (default auto: cuda when built with CUDA and a GPU is present)\n"
                  "  --output FILE         PNG path (default output.png)\n");
 }
 
@@ -65,6 +68,7 @@ Options parse_args(int argc, char** argv) {
         else if (a == "--seed" || a == "-s") o.gen.seed = std::strtoll(need("--seed").c_str(), nullptr, 10);
         else if (a == "--sampler") { o.gen.sampler = need("--sampler"); o.have_sampler = true; }
         else if (a == "--threads" || a == "-t") o.threads = std::atoi(need("--threads").c_str());
+        else if (a == "--device") o.device = need("--device");
         else if (a == "--output" || a == "-o") o.output = need("--output");
         else if (a == "--help" || a == "-h") {
             usage();
@@ -94,10 +98,12 @@ int main(int argc, char** argv) try {
     if (opt.threads > 0) set_num_threads(opt.threads);
     std::fprintf(stderr, "threads: %d\n", num_threads());
 
+    const Device device = parse_device(opt.device);
+    if (device == Device::CUDA) std::fprintf(stderr, "device: cuda (%s)\n", cuda::device_name());
     double t0 = now();
-    Pipeline pipe(opt.model_dir);
-    std::fprintf(stderr, "%s models loaded in %.1fs (generator: %.0fM params)\n", pipe.family_name(), now() - t0,
-                 pipe.generator_params() / 1e6);
+    Pipeline pipe(opt.model_dir, device);
+    std::fprintf(stderr, "%s models loaded in %.1fs (generator: %.0fM params, %s)\n", pipe.family_name(), now() - t0,
+                 pipe.generator_params() / 1e6, device_name(pipe.device()));
     GenerateParams d = pipe.defaults();
     if (!opt.have_steps) opt.gen.steps = d.steps;
     if (!opt.have_cfg) opt.gen.cfg = d.cfg;

@@ -73,7 +73,7 @@ void to_rgb8(const Tensor& img, GenerateResult& r) {
 }  // namespace
 
 // ---------------------------------------------------------------------------
-Pipeline::Pipeline(const std::string& model_dir) : dir_(model_dir) {
+Pipeline::Pipeline(const std::string& model_dir, Device device) : dir_(model_dir), device_(device) {
     Json index = read_json(dir_ + "/model_index.json");
     std::string cls;
     if (const Json* c = index.type == Json::Object ? index.find("_class_name") : nullptr) cls = c->str;
@@ -84,6 +84,7 @@ Pipeline::Pipeline(const std::string& model_dir) : dir_(model_dir) {
     const float vae_scale = (float)json_num(vae_cfg, "scaling_factor", VAEDecoder::kSDScalingFactor);
     const float vae_shift = (float)json_num(vae_cfg, "shift_factor", 0.0);
     vae_w_.load_model(dir_ + "/vae", "diffusion_pytorch_model");
+    vae_w_.to_device(device_);
     vae_.reset(new VAEDecoder(vae_w_, vae_scale, vae_shift));
 
     if (family_ == Family::SD1) {
@@ -91,6 +92,7 @@ Pipeline::Pipeline(const std::string& model_dir) : dir_(model_dir) {
         clip_w_.load_model(dir_ + "/text_encoder", "model");
         clip_.reset(new CLIPTextEncoder(clip_w_));
         unet_w_.load_model(dir_ + "/unet", "diffusion_pytorch_model");
+        unet_w_.to_device(device_);
         unet_.reset(new UNet(unet_w_));
     } else {
         qwen_tok_.reset(new QwenTokenizer(dir_ + "/tokenizer"));
@@ -109,6 +111,7 @@ Pipeline::Pipeline(const std::string& model_dir) : dir_(model_dir) {
         if (const Json* ps = tr_cfg.type == Json::Object ? tr_cfg.find("all_patch_size") : nullptr)
             if (!ps->arr.empty()) cfg.patch = (int)ps->arr[0].num;
         dit_w_.load_model(dir_ + "/transformer", "diffusion_pytorch_model", /*keep_bf16=*/true);
+        dit_w_.to_device(device_);
         dit_.reset(new ZImageTransformer(dit_w_, cfg));
         Json sch = read_json(dir_ + "/scheduler/scheduler_config.json");
         flow_shift_ = (float)json_num(sch, "shift", 3.0);
@@ -153,6 +156,7 @@ GenerateResult Pipeline::generate_sd1(const GenerateParams& p, const ProgressFn&
     const bool use_cfg = p.cfg != 1.0f && p.cfg != 0.0f;
     Tensor context = clip_->forward(tokenizer_->encode(p.prompt));
     if (use_cfg) context = concat_batch(clip_->forward(tokenizer_->encode(p.negative)), context);
+    context = context.to(device_);
 
     std::unique_ptr<Scheduler> sched = make_scheduler(p.sampler == "flow" ? "euler" : p.sampler);
     sched->set_timesteps(p.steps);
@@ -166,12 +170,12 @@ GenerateResult Pipeline::generate_sd1(const GenerateParams& p, const ProgressFn&
         sched->scale_model_input(xin, i);
         Tensor eps;
         if (use_cfg) {
-            Tensor both = unet_->forward(repeat_batch(xin, 2), ts[i], context);
+            Tensor both = unet_->forward(repeat_batch(xin.to(device_), 2), ts[i], context).to(Device::CPU);
             eps = slice_batch(both, 0);
             const Tensor cond = slice_batch(both, 1);
             for (int64_t j = 0; j < eps.numel(); ++j) eps.ptr()[j] += p.cfg * (cond.ptr()[j] - eps.ptr()[j]);
         } else {
-            eps = unet_->forward(xin, ts[i], context);
+            eps = unet_->forward(xin.to(device_), ts[i], context).to(Device::CPU);
         }
         Tensor x0 = sched->predict_x0(x, eps, i);
         sched->step(eps, i, x);
@@ -193,7 +197,7 @@ GenerateResult Pipeline::generate_sd1(const GenerateParams& p, const ProgressFn&
         result.cancelled = true;
         return result;
     }
-    to_rgb8(vae_->decode(x), result);
+    to_rgb8(vae_->decode(x.to(device_)).to(Device::CPU), result);
     result.seconds = now() - t_start;
     return result;
 }
@@ -215,10 +219,10 @@ GenerateResult Pipeline::generate_zimage(const GenerateParams& p, const Progress
         return result;
     }
     const int layers = qwen_->num_layers() - 1;  // hidden_states[-2]
-    Tensor cap = qwen_->forward(qwen_tok_->encode_prompt(p.prompt, max_text_tokens_), layers, false);
+    Tensor cap = qwen_->forward(qwen_tok_->encode_prompt(p.prompt, max_text_tokens_), layers, false).to(device_);
     const bool use_cfg = p.cfg > 0.0f;
     Tensor cap_neg;
-    if (use_cfg) cap_neg = qwen_->forward(qwen_tok_->encode_prompt(p.negative, max_text_tokens_), layers, false);
+    if (use_cfg) cap_neg = qwen_->forward(qwen_tok_->encode_prompt(p.negative, max_text_tokens_), layers, false).to(device_);
 
     FlowMatchScheduler sched(flow_shift_);
     sched.set_timesteps(p.steps);
@@ -227,9 +231,10 @@ GenerateResult Pipeline::generate_zimage(const GenerateParams& p, const Progress
 
     for (int i = 0; i < p.steps; ++i) {
         const double t0 = now();
-        Tensor out = dit_->forward(x, sched.model_time(i), cap);
+        const Tensor x_dev = x.to(device_);
+        Tensor out = dit_->forward(x_dev, sched.model_time(i), cap).to(Device::CPU);
         if (use_cfg) {
-            Tensor neg = dit_->forward(x, sched.model_time(i), cap_neg);
+            Tensor neg = dit_->forward(x_dev, sched.model_time(i), cap_neg).to(Device::CPU);
             for (int64_t j = 0; j < out.numel(); ++j) out.ptr()[j] += p.cfg * (out.ptr()[j] - neg.ptr()[j]);
         }
         Tensor x0 = sched.predict_x0(x, out, i);
@@ -252,7 +257,7 @@ GenerateResult Pipeline::generate_zimage(const GenerateParams& p, const Progress
         result.cancelled = true;
         return result;
     }
-    to_rgb8(vae_->decode(x), result);
+    to_rgb8(vae_->decode(x.to(device_)).to(Device::CPU), result);
     result.seconds = now() - t_start;
     return result;
 }

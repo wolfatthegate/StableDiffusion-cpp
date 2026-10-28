@@ -74,8 +74,10 @@ public:
     enum class Family { SD1, ZImage };
 
     // Loads everything from a diffusers-layout directory (see README).
+    // With Device::CUDA the image generator and the VAE run on the GPU (the
+    // text encoder stays on the CPU: it is cheap and saves GPU memory).
     // Throws std::runtime_error if any file is missing or malformed.
-    explicit Pipeline(const std::string& model_dir);
+    explicit Pipeline(const std::string& model_dir, Device device = Device::CPU);
 
     // Runs text encoding, the sampling loop and VAE decoding. Validates the
     // parameters and throws std::runtime_error on bad values.
@@ -88,6 +90,7 @@ public:
     GenerateParams defaults() const;
     std::vector<std::string> samplers() const;
     const std::string& model_dir() const { return dir_; }
+    Device device() const { return device_; }
     size_t generator_params() const { return family_ == Family::ZImage ? dit_w_.total_params() : unet_w_.total_params(); }
     size_t unet_params() const { return generator_params(); }
 
@@ -99,6 +102,7 @@ public:
 private:
     std::string dir_;
     Family family_ = Family::SD1;
+    Device device_ = Device::CPU;
     // SD 1.x
     std::unique_ptr<CLIPTokenizer> tokenizer_;
     Weights clip_w_, unet_w_;

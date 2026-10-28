@@ -42,6 +42,10 @@ struct Weights {
     // <dir>/<base>.safetensors.index.json, or the .fp16 variant.
     void load_model(const std::string& dir, const std::string& base, bool keep_bf16 = false);
 
+    // Moves every tensor to a device (GPU memory for Device::CUDA, freeing the
+    // host copy). Models keep their pointers into `tensors`, which stay valid.
+    void to_device(Device d);
+
     // Returns the tensor called `name`; throws "missing weight: name" if absent.
     const Tensor& get(const std::string& name) const;
     // Returns the tensor called `name`, or nullptr if absent (optional biases).

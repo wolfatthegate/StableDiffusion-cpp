@@ -272,7 +272,8 @@
       applyFamily(s);
       $('status-dot').className = 'dot ' + (s.busy ? 'busy' : 'ok');
       const name = s.family === 'z-image' ? 'Z-Image' : 'SD 1.x';
-      $('status-text').textContent = `${name} · ${s.model_dir} · ${s.threads} threads` + (s.queue ? ` · ${s.queue} queued` : '');
+      const dev = s.device === 'cuda' ? 'GPU' : `${s.threads} threads`;
+      $('status-text').textContent = `${name} · ${s.model_dir} · ${dev}` + (s.queue ? ` · ${s.queue} queued` : '');
       if (s.current && (!current || current.id !== s.current)) attach(s.current, null);   // re-attach after a reload
     } catch (e) { $('status-dot').className = 'dot'; $('status-text').textContent = 'server unreachable'; }
   }

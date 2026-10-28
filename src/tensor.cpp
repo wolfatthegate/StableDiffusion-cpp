@@ -6,6 +6,7 @@
 #include "tensor.h"
 
 #include <algorithm>
+#include <map>
 #include <atomic>
 #include <cmath>
 #include <condition_variable>
@@ -21,7 +22,82 @@
 #include <Accelerate/Accelerate.h>
 #endif
 
+#include "backend_cuda.h"
+
 namespace sd {
+
+// ============================================================================
+// Devices
+// ============================================================================
+struct DeviceBuffer {
+    void* p = nullptr;
+    size_t bytes = 0;
+    explicit DeviceBuffer(size_t n) : bytes(n) { p = n ? cuda::malloc(n) : nullptr; }
+    ~DeviceBuffer() {
+        if (p) cuda::free(p);
+    }
+    DeviceBuffer(const DeviceBuffer&) = delete;
+    DeviceBuffer& operator=(const DeviceBuffer&) = delete;
+};
+
+const char* device_name(Device d) { return d == Device::CUDA ? "cuda" : "cpu"; }
+
+Device parse_device(const std::string& s) {
+    if (s == "cpu") return Device::CPU;
+    if (s == "cuda") {
+        if (!cuda::available()) throw std::runtime_error("CUDA requested but not available (build with make CUDA=1 on a machine with an NVIDIA GPU)");
+        return Device::CUDA;
+    }
+    if (s == "auto") return cuda::available() ? Device::CUDA : Device::CPU;
+    throw std::runtime_error("unknown device '" + s + "' (use cpu, cuda or auto)");
+}
+
+Tensor::Tensor(std::vector<int64_t> s, Device d) : shape(std::move(s)), device(d) {
+    if (d == Device::CPU) {
+        data.assign((size_t)numel_of(shape), 0.0f);
+    } else {
+        const size_t bytes = (size_t)numel_of(shape) * sizeof(float);
+        dev = std::make_shared<DeviceBuffer>(bytes);
+        if (bytes) cuda::zero(dev->p, bytes);
+    }
+}
+
+void Tensor::check_host() const {
+    if (device != Device::CPU) throw std::runtime_error("tensor is on the GPU; host pointer requested " + shape_str());
+}
+float* Tensor::dptr() { return device == Device::CUDA && dev ? (float*)dev->p : nullptr; }
+const float* Tensor::dptr() const { return device == Device::CUDA && dev ? (const float*)dev->p : nullptr; }
+const uint16_t* Tensor::dptr16() const { return device == Device::CUDA && dev ? (const uint16_t*)dev->p : nullptr; }
+
+Tensor Tensor::to(Device d) const {
+    if (d == device) return *this;
+    Tensor t;
+    t.shape = shape;
+    t.dtype = dtype;
+    t.device = d;
+    const size_t n = (size_t)numel();
+    const size_t bytes = n * (dtype == DType::F32 ? sizeof(float) : sizeof(uint16_t));
+    if (d == Device::CUDA) {
+        t.dev = std::make_shared<DeviceBuffer>(bytes);
+        if (bytes) cuda::upload(t.dev->p, dtype == DType::F32 ? (const void*)data.data() : (const void*)data16.data(), bytes);
+    } else {
+        if (dtype == DType::F32) {
+            t.data.resize(n);
+            if (bytes) cuda::download(t.data.data(), dev->p, bytes);
+        } else {
+            t.data16.resize(n);
+            if (bytes) cuda::download(t.data16.data(), dev->p, bytes);
+        }
+    }
+    return t;
+}
+
+namespace {
+// Every op requires its inputs on one device.
+void same_device(const Tensor& a, const Tensor& b, const char* op) {
+    if (a.device != b.device) throw std::runtime_error(std::string(op) + ": tensors on different devices");
+}
+}  // namespace
 
 int64_t Tensor::numel_of(const std::vector<int64_t>& s) {
     int64_t n = 1;
@@ -408,7 +484,15 @@ Tensor linear(const Tensor& x, const Tensor& W, const Tensor* b) {
     const int64_t rows = x.numel() / in;
     std::vector<int64_t> oshape = x.shape;
     oshape.back() = out;
-    Tensor y(oshape);
+    same_device(x, W, "linear");
+    Tensor y(oshape, x.device);
+    if (x.is_cuda()) {
+        if (W.is_bf16())
+            cuda::gemm_nt_bf16(rows, out, in, x.dptr(), in, W.dptr16(), in, y.dptr(), out, b ? b->dptr() : nullptr, false);
+        else
+            cuda::gemm_nt_f32(rows, out, in, x.dptr(), in, W.dptr(), in, y.dptr(), out, b ? b->dptr() : nullptr, false);
+        return y;
+    }
     if (W.is_bf16())
         gemm_nt_bf16(rows, out, in, x.ptr(), in, W.ptr16(), in, y.ptr(), out, b ? b->ptr() : nullptr, false);
     else
@@ -417,6 +501,7 @@ Tensor linear(const Tensor& x, const Tensor& W, const Tensor* b) {
 }
 
 Tensor embedding(const Tensor& table, const std::vector<int32_t>& ids) {
+    if (table.is_cuda()) throw std::runtime_error("embedding: table must be on the CPU");
     const int64_t V = table.dim(0), D = table.dim(1);
     Tensor y({(int64_t)ids.size(), D});
     for (size_t i = 0; i < ids.size(); ++i) {
@@ -447,6 +532,13 @@ Tensor conv2d(const Tensor& x, const Tensor& W, const Tensor* b, int stride, int
     if (W.dim(1) != Cin) throw std::runtime_error("conv2d: input " + x.shape_str() + " vs weight " + W.shape_str());
     const int64_t Ho = (H + 2 * pad - kh) / stride + 1, Wo = (Wd + 2 * pad - kw) / stride + 1;
     const int64_t K = Cin * kh * kw, HW = Ho * Wo;
+    same_device(x, W, "conv2d");
+    if (x.is_cuda()) {
+        if (W.is_bf16()) throw std::runtime_error("conv2d: bf16 conv weights are not supported");
+        Tensor out({N, Cout, Ho, Wo}, Device::CUDA);
+        cuda::conv2d(x.dptr(), N, Cin, H, Wd, W.dptr(), Cout, kh, kw, b ? b->dptr() : nullptr, stride, pad, out.dptr(), Ho, Wo);
+        return out;
+    }
     Tensor out({N, Cout, Ho, Wo});
     if (b) {  // bias is per output channel (a GEMM row), so seed the output with it
         for (int64_t n = 0; n < N; ++n)
@@ -501,6 +593,11 @@ Tensor group_norm(const Tensor& x, int groups, const Tensor& gamma, const Tensor
     const int64_t N = x.dim(0), C = x.dim(1), HW = x.numel() / (N * C);
     if (C % groups != 0) throw std::runtime_error("group_norm: channels not divisible by groups");
     const int64_t cg = C / groups, len = cg * HW;
+    if (x.is_cuda()) {
+        Tensor y(x.shape, Device::CUDA);
+        cuda::group_norm(x.dptr(), y.dptr(), N, C, HW, groups, gamma.dptr(), beta.dptr(), eps);
+        return y;
+    }
     Tensor y(x.shape);
     parallel_for(N * groups, [&](int64_t t) {
         const int64_t n = t / groups, g = t % groups;
@@ -530,6 +627,11 @@ Tensor group_norm(const Tensor& x, int groups, const Tensor& gamma, const Tensor
 // Two-pass (mean, then variance) per row, rows processed in parallel.
 Tensor layer_norm(const Tensor& x, const Tensor* gamma, const Tensor* beta, float eps) {
     const int64_t C = x.dim(-1), rows = x.numel() / C;
+    if (x.is_cuda()) {
+        Tensor y(x.shape, Device::CUDA);
+        cuda::layer_norm(x.dptr(), y.dptr(), rows, C, gamma ? gamma->dptr() : nullptr, beta ? beta->dptr() : nullptr, eps);
+        return y;
+    }
     Tensor y(x.shape);
     parallel_chunks(rows, 8, [&](int64_t rb, int64_t re) {
         for (int64_t r = rb; r < re; ++r) {
@@ -557,6 +659,11 @@ Tensor layer_norm(const Tensor& x, const Tensor* gamma, const Tensor* beta, floa
 
 Tensor rms_norm(const Tensor& x, const Tensor* gamma, float eps) {
     const int64_t C = x.dim(-1), rows = x.numel() / C;
+    if (x.is_cuda()) {
+        Tensor y(x.shape, Device::CUDA);
+        cuda::rms_norm(x.dptr(), y.dptr(), rows, C, gamma ? gamma->dptr() : nullptr, eps);
+        return y;
+    }
     Tensor y(x.shape);
     parallel_chunks(rows, 8, [&](int64_t rb, int64_t re) {
         for (int64_t r = rb; r < re; ++r) {
@@ -573,6 +680,10 @@ Tensor rms_norm(const Tensor& x, const Tensor* gamma, float eps) {
 
 void rms_norm_heads_(Tensor& x, int64_t dim, const Tensor* gamma, float eps) {
     const int64_t groups = x.numel() / dim;
+    if (x.is_cuda()) {
+        cuda::rms_norm_heads(x.dptr(), groups, dim, gamma ? gamma->dptr() : nullptr, eps);
+        return;
+    }
     parallel_chunks(groups, 64, [&](int64_t gb, int64_t ge) {
         for (int64_t g = gb; g < ge; ++g) {
             float* p = x.ptr() + g * dim;
@@ -587,6 +698,11 @@ void rms_norm_heads_(Tensor& x, int64_t dim, const Tensor* gamma, float eps) {
 void rope_(Tensor& x, int64_t dim, const Tensor& cos, const Tensor& sin, bool interleaved) {
     const int64_t inner = x.dim(-1), S = x.dim(-2), N = x.numel() / (S * inner), heads = inner / dim;
     if (cos.dim(0) < S || cos.dim(1) != dim) throw std::runtime_error("rope_: table shape mismatch");
+    same_device(x, cos, "rope_");
+    if (x.is_cuda()) {
+        cuda::rope(x.dptr(), N, S, inner, dim, cos.dptr(), sin.dptr(), interleaved);
+        return;
+    }
     const int64_t half = dim / 2;
     parallel_chunks(N * S, 16, [&](int64_t b, int64_t e) {
         for (int64_t ns = b; ns < e; ++ns) {
@@ -615,6 +731,12 @@ void rope_(Tensor& x, int64_t dim, const Tensor& cos, const Tensor& sin, bool in
 
 Tensor swiglu(const Tensor& gate, const Tensor& up) {
     if (gate.numel() != up.numel()) throw std::runtime_error("swiglu: shape mismatch");
+    same_device(gate, up, "swiglu");
+    if (gate.is_cuda()) {
+        Tensor y(gate.shape, Device::CUDA);
+        cuda::swiglu(gate.dptr(), up.dptr(), y.dptr(), y.numel());
+        return y;
+    }
     Tensor y(gate.shape);
     const float* g = gate.ptr();
     const float* u = up.ptr();
@@ -660,6 +782,12 @@ Tensor attention(const Tensor& q, const Tensor& k, const Tensor& v, int heads, b
         throw std::runtime_error("attention: shape mismatch q" + q.shape_str() + " k" + k.shape_str());
     const int64_t group = heads / kv_heads;
     const float scale = 1.0f / std::sqrt((float)d);
+    same_device(q, k, "attention");
+    if (q.is_cuda()) {
+        Tensor out({N, Sq, inner}, Device::CUDA);
+        cuda::attention(q.dptr(), k.dptr(), v.dptr(), out.dptr(), N, Sq, Skv, heads, kv_heads, d, causal);
+        return out;
+    }
     Tensor out({N, Sq, inner});
     std::vector<float> scores((size_t)(Sq * Skv));
     std::vector<float> vT((size_t)(d * Skv));
@@ -686,6 +814,11 @@ Tensor geglu(const Tensor& x) {
     const int64_t D2 = x.dim(-1), D = D2 / 2, rows = x.numel() / D2;
     std::vector<int64_t> oshape = x.shape;
     oshape.back() = D;
+    if (x.is_cuda()) {
+        Tensor y(oshape, Device::CUDA);
+        cuda::geglu(x.dptr(), y.dptr(), rows, D);
+        return y;
+    }
     Tensor y(oshape);
     parallel_chunks(rows, 8, [&](int64_t rb, int64_t re) {
         for (int64_t r = rb; r < re; ++r) {
@@ -708,18 +841,21 @@ Tensor geglu(const Tensor& x) {
 // transposes and are parallelised per (sample, channel).
 // ============================================================================
 void silu_(Tensor& x) {
+    if (x.is_cuda()) { cuda::silu(x.dptr(), x.numel()); return; }
     float* p = x.ptr();
     parallel_chunks(x.numel(), 16384, [&](int64_t b, int64_t e) {
         for (int64_t i = b; i < e; ++i) p[i] = p[i] / (1.0f + std::exp(-p[i]));
     });
 }
 void gelu_(Tensor& x) {
+    if (x.is_cuda()) { cuda::gelu(x.dptr(), x.numel()); return; }
     float* p = x.ptr();
     parallel_chunks(x.numel(), 16384, [&](int64_t b, int64_t e) {
         for (int64_t i = b; i < e; ++i) p[i] = 0.5f * p[i] * (1.0f + std::erf(p[i] * 0.70710678118654752f));
     });
 }
 void quick_gelu_(Tensor& x) {
+    if (x.is_cuda()) { cuda::quick_gelu(x.dptr(), x.numel()); return; }
     float* p = x.ptr();
     parallel_chunks(x.numel(), 16384, [&](int64_t b, int64_t e) {
         for (int64_t i = b; i < e; ++i) p[i] = p[i] / (1.0f + std::exp(-1.702f * p[i]));
@@ -727,6 +863,8 @@ void quick_gelu_(Tensor& x) {
 }
 void add_(Tensor& a, const Tensor& b) {
     if (a.numel() != b.numel()) throw std::runtime_error("add_: " + a.shape_str() + " vs " + b.shape_str());
+    same_device(a, b, "add_");
+    if (a.is_cuda()) { cuda::add(a.dptr(), b.dptr(), a.numel()); return; }
     float* p = a.ptr();
     const float* q = b.ptr();
     parallel_chunks(a.numel(), 16384, [&](int64_t s, int64_t e) {
@@ -734,11 +872,115 @@ void add_(Tensor& a, const Tensor& b) {
     });
 }
 void scale_(Tensor& x, float s) {
+    if (x.is_cuda()) { cuda::scale(x.dptr(), s, x.numel()); return; }
     for (float& v : x.data) v *= s;
+}
+
+void affine_(Tensor& x, float a, float b) {
+    if (x.is_cuda()) { cuda::affine(x.dptr(), a, b, x.numel()); return; }
+    for (float& v : x.data) v = v * a + b;
+}
+
+void mul_rows_(Tensor& x, const Tensor& v) {
+    const int64_t dim = x.dim(-1), rows = x.numel() / dim;
+    if (v.numel() != dim) throw std::runtime_error("mul_rows_: vector size mismatch");
+    same_device(x, v, "mul_rows_");
+    if (x.is_cuda()) { cuda::mul_rows(x.dptr(), v.dptr(), rows, dim); return; }
+    const float* vv = v.ptr();
+    parallel_chunks(rows, 16, [&](int64_t rb, int64_t re) {
+        for (int64_t r = rb; r < re; ++r) {
+            float* p = x.ptr() + r * dim;
+            for (int64_t i = 0; i < dim; ++i) p[i] *= vv[i];
+        }
+    });
+}
+
+void add_rows_scaled_(Tensor& x, const Tensor& y, const Tensor& g) {
+    const int64_t dim = x.dim(-1), rows = x.numel() / dim;
+    if (y.numel() != x.numel() || g.numel() != dim) throw std::runtime_error("add_rows_scaled_: shape mismatch");
+    same_device(x, y, "add_rows_scaled_");
+    same_device(x, g, "add_rows_scaled_");
+    if (x.is_cuda()) { cuda::add_rows_scaled(x.dptr(), y.dptr(), g.dptr(), rows, dim); return; }
+    const float* gg = g.ptr();
+    parallel_chunks(rows, 16, [&](int64_t rb, int64_t re) {
+        for (int64_t r = rb; r < re; ++r) {
+            float* p = x.ptr() + r * dim;
+            const float* q = y.ptr() + r * dim;
+            for (int64_t i = 0; i < dim; ++i) p[i] += gg[i] * q[i];
+        }
+    });
+}
+
+void add_channel_bias_(Tensor& x, const Tensor& b) {
+    const int64_t N = x.dim(0), C = x.dim(1), HW = x.numel() / (N * C);
+    if (b.numel() != N * C) throw std::runtime_error("add_channel_bias_: expected [N, C] bias");
+    same_device(x, b, "add_channel_bias_");
+    if (x.is_cuda()) { cuda::add_channel_bias(x.dptr(), b.dptr(), N, C, HW); return; }
+    parallel_for(N * C, [&](int64_t nc) {
+        const float add = b.ptr()[nc];
+        float* p = x.ptr() + nc * HW;
+        for (int64_t i = 0; i < HW; ++i) p[i] += add;
+    });
+}
+
+Tensor patchify2d(const Tensor& x, int p) {
+    const int64_t C = x.dim(1), H = x.dim(2), W = x.dim(3), Ht = H / p, Wt = W / p;
+    if (x.dim(0) != 1 || H % p || W % p) throw std::runtime_error("patchify2d: bad shape " + x.shape_str());
+    if (x.is_cuda()) {
+        Tensor y({Ht * Wt, (int64_t)p * p * C}, Device::CUDA);
+        cuda::patchify(x.dptr(), y.dptr(), C, H, W, p);
+        return y;
+    }
+    Tensor y({Ht * Wt, (int64_t)p * p * C});
+    for (int64_t h = 0; h < Ht; ++h)
+        for (int64_t w = 0; w < Wt; ++w) {
+            float* tok = y.ptr() + (h * Wt + w) * p * p * C;
+            for (int64_t ph = 0; ph < p; ++ph)
+                for (int64_t pw = 0; pw < p; ++pw)
+                    for (int64_t c = 0; c < C; ++c)
+                        tok[(ph * p + pw) * C + c] = x.ptr()[(c * H + h * p + ph) * W + w * p + pw];
+        }
+    return y;
+}
+
+Tensor unpatchify2d(const Tensor& tokens, int64_t C, int64_t H, int64_t W, int p) {
+    const int64_t Ht = H / p, Wt = W / p;
+    if (tokens.numel() < Ht * Wt * p * p * C) throw std::runtime_error("unpatchify2d: too few tokens");
+    if (tokens.is_cuda()) {
+        Tensor y({1, C, H, W}, Device::CUDA);
+        cuda::unpatchify(tokens.dptr(), y.dptr(), C, H, W, p);
+        return y;
+    }
+    Tensor y({1, C, H, W});
+    for (int64_t h = 0; h < Ht; ++h)
+        for (int64_t w = 0; w < Wt; ++w) {
+            const float* tok = tokens.ptr() + (h * Wt + w) * p * p * C;
+            for (int64_t ph = 0; ph < p; ++ph)
+                for (int64_t pw = 0; pw < p; ++pw)
+                    for (int64_t c = 0; c < C; ++c) y.ptr()[(c * H + h * p + ph) * W + w * p + pw] = tok[(ph * p + pw) * C + c];
+        }
+    return y;
+}
+
+Tensor slice_rows(const Tensor& x, int64_t from, int64_t to) {
+    const int64_t D = x.dim(-1), rows = x.numel() / D;
+    if (from < 0 || to > rows || from > to) throw std::runtime_error("slice_rows: range out of bounds");
+    Tensor y({to - from, D}, x.device);
+    const size_t bytes = (size_t)((to - from) * D) * sizeof(float);
+    if (x.is_cuda())
+        cuda::copy(y.dptr(), x.dptr() + from * D, bytes);
+    else
+        std::memcpy(y.ptr(), x.ptr() + from * D, bytes);
+    return y;
 }
 
 Tensor upsample_nearest2x(const Tensor& x) {
     const int64_t N = x.dim(0), C = x.dim(1), H = x.dim(2), W = x.dim(3);
+    if (x.is_cuda()) {
+        Tensor y({N, C, 2 * H, 2 * W}, Device::CUDA);
+        cuda::upsample_nearest2x(x.dptr(), y.dptr(), N * C, H, W);
+        return y;
+    }
     Tensor y({N, C, 2 * H, 2 * W});
     parallel_for(N * C, [&](int64_t nc) {
         const float* p = x.ptr() + nc * H * W;
@@ -760,6 +1002,12 @@ Tensor concat_channels(const Tensor& a, const Tensor& b) {
     const int64_t N = a.dim(0), Ca = a.dim(1), Cb = b.dim(1), H = a.dim(2), W = a.dim(3);
     if (b.dim(0) != N || b.dim(2) != H || b.dim(3) != W)
         throw std::runtime_error("concat_channels: " + a.shape_str() + " vs " + b.shape_str());
+    same_device(a, b, "concat_channels");
+    if (a.is_cuda()) {
+        Tensor y({N, Ca + Cb, H, W}, Device::CUDA);
+        cuda::concat_channels(a.dptr(), b.dptr(), y.dptr(), N, Ca, Cb, H * W);
+        return y;
+    }
     Tensor y({N, Ca + Cb, H, W});
     const int64_t HW = H * W;
     for (int64_t n = 0; n < N; ++n) {
@@ -772,6 +1020,13 @@ Tensor concat_channels(const Tensor& a, const Tensor& b) {
 Tensor concat_batch(const Tensor& a, const Tensor& b) {
     std::vector<int64_t> s = a.shape;
     s[0] += b.dim(0);
+    same_device(a, b, "concat_batch");
+    if (a.is_cuda()) {
+        Tensor y(s, Device::CUDA);
+        cuda::copy(y.dptr(), a.dptr(), a.numel() * sizeof(float));
+        cuda::copy(y.dptr() + a.numel(), b.dptr(), b.numel() * sizeof(float));
+        return y;
+    }
     Tensor y(s);
     std::memcpy(y.ptr(), a.ptr(), a.numel() * sizeof(float));
     std::memcpy(y.ptr() + a.numel(), b.ptr(), b.numel() * sizeof(float));
@@ -780,6 +1035,11 @@ Tensor concat_batch(const Tensor& a, const Tensor& b) {
 
 Tensor nchw_to_nlc(const Tensor& x) {
     const int64_t N = x.dim(0), C = x.dim(1), HW = x.dim(2) * x.dim(3);
+    if (x.is_cuda()) {
+        Tensor y({N, HW, C}, Device::CUDA);
+        cuda::nchw_to_nlc(x.dptr(), y.dptr(), N, C, HW);
+        return y;
+    }
     Tensor y({N, HW, C});
     parallel_for(N * C, [&](int64_t nc) {
         const int64_t n = nc / C, c = nc % C;
@@ -793,6 +1053,11 @@ Tensor nchw_to_nlc(const Tensor& x) {
 Tensor nlc_to_nchw(const Tensor& x, int64_t H, int64_t W) {
     const int64_t N = x.dim(0), HW = x.dim(1), C = x.dim(2);
     if (HW != H * W) throw std::runtime_error("nlc_to_nchw: bad spatial size");
+    if (x.is_cuda()) {
+        Tensor y({N, C, H, W}, Device::CUDA);
+        cuda::nlc_to_nchw(x.dptr(), y.dptr(), N, C, HW);
+        return y;
+    }
     Tensor y({N, C, H, W});
     parallel_for(N * C, [&](int64_t nc) {
         const int64_t n = nc / C, c = nc % C;
@@ -806,17 +1071,25 @@ Tensor nlc_to_nchw(const Tensor& x, int64_t H, int64_t W) {
 Tensor slice_batch(const Tensor& x, int64_t b) {
     std::vector<int64_t> s = x.shape;
     s[0] = 1;
-    Tensor y(s);
+    Tensor y(s, x.device);
     const int64_t per = x.numel() / x.dim(0);
-    std::memcpy(y.ptr(), x.ptr() + b * per, per * sizeof(float));
+    if (x.is_cuda())
+        cuda::copy(y.dptr(), x.dptr() + b * per, per * sizeof(float));
+    else
+        std::memcpy(y.ptr(), x.ptr() + b * per, per * sizeof(float));
     return y;
 }
 
 Tensor repeat_batch(const Tensor& x, int64_t times) {
     std::vector<int64_t> s = x.shape;
     s[0] = x.dim(0) * times;
-    Tensor y(s);
-    for (int64_t t = 0; t < times; ++t) std::memcpy(y.ptr() + t * x.numel(), x.ptr(), x.numel() * sizeof(float));
+    Tensor y(s, x.device);
+    for (int64_t t = 0; t < times; ++t) {
+        if (x.is_cuda())
+            cuda::copy(y.dptr() + t * x.numel(), x.dptr(), x.numel() * sizeof(float));
+        else
+            std::memcpy(y.ptr() + t * x.numel(), x.ptr(), x.numel() * sizeof(float));
+    }
     return y;
 }
 
