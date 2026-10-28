@@ -847,6 +847,11 @@ void silu_(Tensor& x) {
         for (int64_t i = b; i < e; ++i) p[i] = p[i] / (1.0f + std::exp(-p[i]));
     });
 }
+void tanh_(Tensor& x) {
+    if (x.is_cuda()) { cuda::tanh(x.dptr(), x.numel()); return; }
+    for (float& v : x.data) v = std::tanh(v);
+}
+
 void gelu_(Tensor& x) {
     if (x.is_cuda()) { cuda::gelu(x.dptr(), x.numel()); return; }
     float* p = x.ptr();

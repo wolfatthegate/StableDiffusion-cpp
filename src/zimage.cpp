@@ -90,22 +90,25 @@ void ZImageTransformer::rope_tables(const std::vector<std::array<int, 3>>& pos, 
 void ZImageTransformer::run_block(const Block& b, Tensor& x, const Tensor& cos, const Tensor& sin,
                                   const Tensor* adaln) const {
     const int64_t D = dim_;
-    // Modulation vectors: tiny, so computed on the CPU and sent to x's device.
+    // Modulation vectors, computed where x lives (no host round trip on the
+    // GPU): mod [1, 4D] = scale_msa | gate_msa | scale_mlp | gate_mlp, with
+    // scales as 1 + s and gates as tanh(g).
     Tensor scale_msa, gate_msa, scale_mlp, gate_mlp;
     if (b.adaln.valid()) {
-        Tensor mod = b.adaln(*adaln).to(Device::CPU);  // [1, 4D]: scale_msa, gate_msa, scale_mlp, gate_mlp
-        const float* m = mod.ptr();
-        Tensor sm({D}), gm({D}), sf({D}), gf({D});
-        for (int64_t i = 0; i < D; ++i) {
-            sm.ptr()[i] = 1.0f + m[i];
-            gm.ptr()[i] = std::tanh(m[D + i]);
-            sf.ptr()[i] = 1.0f + m[2 * D + i];
-            gf.ptr()[i] = std::tanh(m[3 * D + i]);
-        }
-        scale_msa = sm.to(x.device);
-        gate_msa = gm.to(x.device);
-        scale_mlp = sf.to(x.device);
-        gate_mlp = gf.to(x.device);
+        Tensor mod = b.adaln(*adaln);
+        mod.reshape({4, D});
+        scale_msa = slice_rows(mod, 0, 1);
+        gate_msa = slice_rows(mod, 1, 2);
+        scale_mlp = slice_rows(mod, 2, 3);
+        gate_mlp = slice_rows(mod, 3, 4);
+        affine_(scale_msa, 1.0f, 1.0f);
+        affine_(scale_mlp, 1.0f, 1.0f);
+        tanh_(gate_msa);
+        tanh_(gate_mlp);
+        scale_msa.reshape({D});
+        gate_msa.reshape({D});
+        scale_mlp.reshape({D});
+        gate_mlp.reshape({D});
     }
     // attention
     Tensor h = rms_norm(x, b.attn_norm1, cfg_.norm_eps);

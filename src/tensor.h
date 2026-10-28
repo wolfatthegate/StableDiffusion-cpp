@@ -220,6 +220,8 @@ Tensor geglu(const Tensor& x);
 
 // In-place SiLU (swish): x * sigmoid(x).
 void silu_(Tensor& x);
+// In-place hyperbolic tangent.
+void tanh_(Tensor& x);
 // In-place exact GELU: 0.5 x (1 + erf(x / sqrt 2)).
 void gelu_(Tensor& x);
 // In-place "quick GELU" used by OpenAI CLIP: x * sigmoid(1.702 x).

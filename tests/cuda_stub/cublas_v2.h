@@ -12,6 +12,9 @@ cublasStatus_t cublasCreate(cublasHandle_t* h);
 cublasStatus_t cublasSetMathMode(cublasHandle_t h, cublasMath_t m);
 cublasStatus_t cublasSgemm(cublasHandle_t h, cublasOperation_t ta, cublasOperation_t tb, int m, int n, int k, const float* alpha,
                            const float* A, int lda, const float* B, int ldb, const float* beta, float* C, int ldc);
+cublasStatus_t cublasSgemmStridedBatched(cublasHandle_t h, cublasOperation_t ta, cublasOperation_t tb, int m, int n, int k,
+                                         const float* alpha, const float* A, int lda, long long strideA, const float* B, int ldb,
+                                         long long strideB, const float* beta, float* C, int ldc, long long strideC, int batch);
 cublasStatus_t cublasGemmEx(cublasHandle_t h, cublasOperation_t ta, cublasOperation_t tb, int m, int n, int k, const void* alpha,
                             const void* A, cudaDataType at, int lda, const void* B, cudaDataType bt, int ldb, const void* beta,
                             void* C, cudaDataType ct, int ldc, cublasComputeType_t compute, cublasGemmAlgo_t algo);

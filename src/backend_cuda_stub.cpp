@@ -39,6 +39,7 @@ void attention(const float*, const float*, const float*, float*, int64_t, int64_
 void geglu(const float*, float*, int64_t, int64_t) { unavailable(); }
 void swiglu(const float*, const float*, float*, int64_t) { unavailable(); }
 void silu(float*, int64_t) { unavailable(); }
+void tanh(float*, int64_t) { unavailable(); }
 void gelu(float*, int64_t) { unavailable(); }
 void quick_gelu(float*, int64_t) { unavailable(); }
 void add(float*, const float*, int64_t) { unavailable(); }

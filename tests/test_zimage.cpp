@@ -4,6 +4,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <fstream>
 #include <sstream>
 #include <string>
@@ -43,13 +44,19 @@ int main(int argc, char** argv) {
     cap.shape.insert(cap.shape.begin(), 1);  // [1, L, 2560]
 
     auto t0 = steady_clock::now();
+    // SD_TEST_DEVICE=cuda runs the same comparison on the GPU.
+    const char* dev_env = std::getenv("SD_TEST_DEVICE");
+    const sd::Device dev = sd::parse_device(dev_env ? dev_env : "cpu");
     sd::Weights w;
     w.load_model(dir + "/transformer", "diffusion_pytorch_model", /*keep_bf16=*/true);
+    w.to_device(dev);
     sd::ZImageTransformer tr(w);
-    std::printf("loaded %zu tensors in %.1fs\n", w.tensors.size(), duration<double>(steady_clock::now() - t0).count());
+    std::printf("loaded %zu tensors in %.1fs on %s\n", w.tensors.size(), duration<double>(steady_clock::now() - t0).count(),
+                sd::device_name(dev));
 
+    tr.forward(x.to(dev), t, cap.to(dev));  // warm-up (allocator, cuBLAS heuristics)
     t0 = steady_clock::now();
-    sd::Tensor out = tr.forward(x, t, cap);
+    sd::Tensor out = tr.forward(x.to(dev), t, cap.to(dev)).to(sd::Device::CPU);
     std::printf("forward %s, %lld text tokens, t=%.3f: %.1fs\n", x.shape_str().c_str(), (long long)cap.dim(1), t,
                 duration<double>(steady_clock::now() - t0).count());
     if (out.numel() != ref.numel()) {
