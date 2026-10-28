@@ -44,14 +44,18 @@ int main(int argc, char** argv) {
     const float scaling = argc > 3 ? (float)std::atof(argv[3]) : (float)meta.at("scaling_factor").num;
     const float shift = argc > 4 ? (float)std::atof(argv[4]) : (float)meta.at("shift_factor").num;
 
+    // SD_TEST_DEVICE=cuda runs the same comparison on the GPU.
+    const char* dev_env = std::getenv("SD_TEST_DEVICE");
+    const sd::Device dev = sd::parse_device(dev_env ? dev_env : "cpu");
     sd::Weights w;
     w.load_model(dir + "/vae", "diffusion_pytorch_model");
+    w.to_device(dev);
     sd::VAEDecoder vae(w, scaling, shift);
     sd::Tensor z;
     z.shape = in_shape;
     z.data = in;
     auto t0 = steady_clock::now();
-    sd::Tensor img = vae.decode(z);
+    sd::Tensor img = vae.decode(z.to(dev)).to(sd::Device::CPU);
     std::printf("decoded %s -> %s in %.2fs (latent channels %d)\n", z.shape_str().c_str(), img.shape_str().c_str(),
                 duration<double>(steady_clock::now() - t0).count(), vae.latent_channels());
     if (img.numel() != (int64_t)ref.size()) {

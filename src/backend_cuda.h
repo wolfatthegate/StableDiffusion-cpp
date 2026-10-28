@@ -62,6 +62,7 @@ void swiglu(const float* gate, const float* up, float* y, int64_t n);
 
 // Elementwise and shape ops.
 void silu(float* x, int64_t n);
+void tanh(float* x, int64_t n);
 void gelu(float* x, int64_t n);
 void quick_gelu(float* x, int64_t n);
 void add(float* a, const float* b, int64_t n);

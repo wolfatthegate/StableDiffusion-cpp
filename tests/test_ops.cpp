@@ -8,6 +8,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <functional>
 #include <random>
 
 #include "backend_cuda.h"
@@ -323,6 +324,35 @@ static void cuda_check(const char* name, const Tensor& cpu, const Tensor& gpu, d
     check(label, max_diff(cpu, gpu), tol);
 }
 
+// GPU throughput for the two operations that dominate Z-Image at 1024x1024:
+// one attention projection (bf16 weights) and one layer's attention.
+static double gpu_ms(const std::function<void()>& fn, int reps) {
+    fn();  // warm-up (cuBLAS heuristics, allocator)
+    Tensor sink = Tensor({1}, Device::CUDA).to(Device::CPU);  // synchronise
+    auto t0 = std::chrono::steady_clock::now();
+    for (int r = 0; r < reps; ++r) fn();
+    sink = Tensor({1}, Device::CUDA).to(Device::CPU);
+    return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count() / reps;
+}
+
+static void bench_cuda(std::mt19937& rng) {
+    const Device G = Device::CUDA;
+    {
+        const int M = 4128, N = 3840, K = 3840;
+        Tensor x = randn_t({M, K}, rng).to(G), W = randn_t({N, K}, rng);
+        W.to_bf16();
+        Tensor Wg = W.to(G);
+        double ms = gpu_ms([&] { Tensor y = linear(x, Wg, nullptr); }, 10);
+        std::printf("cuda linear bf16 %dx%dx%d: %.2f ms  %.1f TFLOP/s\n", M, N, K, ms, 2.0 * M * N * K / ms / 1e9);
+    }
+    {
+        const int S = 4128, H = 30, d = 128;
+        Tensor q = randn_t({1, S, H * d}, rng).to(G), k = randn_t({1, S, H * d}, rng).to(G), v = randn_t({1, S, H * d}, rng).to(G);
+        double ms = gpu_ms([&] { Tensor o = attention(q, k, v, H); }, 5);
+        std::printf("cuda attention %d tokens x %d heads: %.2f ms  %.1f TFLOP/s\n", S, H, ms, 4.0 * S * S * d * H / ms / 1e9);
+    }
+}
+
 static void test_cuda(std::mt19937& rng) {
     if (!cuda::available()) {
         std::printf("cuda: not available, GPU comparisons skipped\n");
@@ -389,12 +419,14 @@ static void test_cuda(std::mt19937& rng) {
         cuda_check("swiglu", swiglu(x, u), swiglu(x.to(G), u.to(G)), 1e-5);
         Tensor gg = randn_t({6, 40}, rng);
         cuda_check("geglu", geglu(gg), geglu(gg.to(G)), 1e-5);
-        for (int k = 0; k < 3; ++k) {
+        for (int k = 0; k < 4; ++k) {
             Tensor a = randn_t({1000}, rng), b = a.to(G);
             if (k == 0) { silu_(a); silu_(b); }
             if (k == 1) { gelu_(a); gelu_(b); }
             if (k == 2) { quick_gelu_(a); quick_gelu_(b); }
-            cuda_check(k == 0 ? "silu_" : k == 1 ? "gelu_" : "quick_gelu_", a, b, 1e-5);
+            if (k == 3) { tanh_(a); tanh_(b); }
+            const char* names[] = {"silu_", "gelu_", "quick_gelu_", "tanh_"};
+            cuda_check(names[k], a, b, 1e-5);
         }
         Tensor a = randn_t({1000}, rng), b = randn_t({1000}, rng), ag = a.to(G);
         add_(a, b); add_(ag, b.to(G));
@@ -413,6 +445,10 @@ static void test_cuda(std::mt19937& rng) {
         cuda_check("attention gqa", attention(q, kk, vv, 3, false, 1), attention(q.to(G), kk.to(G), vv.to(G), 3, false, 1), 1e-4);
         Tensor qb = randn_t({1, 100, 64}, rng), kb = randn_t({1, 100, 64}, rng), vb = randn_t({1, 100, 64}, rng);
         cuda_check("attention 100 tokens", attention(qb, kb, vb, 2), attention(qb.to(G), kb.to(G), vb.to(G), 2), 1e-4);
+        // Qwen3-like: 8 query heads over 2 key/value heads, causal, batch 2.
+        Tensor q8 = randn_t({2, 37, 8 * 16}, rng), k2 = randn_t({2, 37, 2 * 16}, rng), v2 = randn_t({2, 37, 2 * 16}, rng);
+        cuda_check("attention gqa 8/2 causal", attention(q8, k2, v2, 8, true, 2),
+                   attention(q8.to(G), k2.to(G), v2.to(G), 8, true, 2), 1e-4);
     }
     // row helpers and shape ops
     {
@@ -439,6 +475,7 @@ static void test_cuda(std::mt19937& rng) {
         Tensor tok = patchify2d(lat, 2);
         cuda_check("unpatchify2d", unpatchify2d(tok, 16, 6, 8, 2), unpatchify2d(tok.to(G), 16, 6, 8, 2), 0.0);
     }
+    bench_cuda(rng);
 }
 
 int main() {

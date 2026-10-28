@@ -3,10 +3,13 @@
 //
 // Design: plain kernels for everything except matrix products, which go to
 // cuBLAS (float32 SGEMM, or bf16 tensor-core GemmEx with float32
-// accumulation for bf16 weights). Attention is done per (batch, head): one
-// SGEMM for the scores, a softmax kernel, one SGEMM for the weighted sum. A
-// small caching allocator keeps cudaMalloc off the hot path. Everything runs
-// on the default stream, in order, so calls are implicitly ordered.
+// accumulation for bf16 weights). Attention batches all heads into strided
+// batched GEMMs (one launch for the scores, one softmax, one for the weighted
+// sum), in chunks that bound the score buffer. Reductions use float32 warp
+// shuffles. A size-class caching allocator keeps cudaMalloc, which
+// synchronises the device, off the hot path. Everything runs on the default
+// stream, in order; device-to-device copies and memsets are asynchronous.
+// Env:   SD_CUDA_ATTN_MB=<n> caps the attention score buffer (default 1024).
 //
 // Build: make CUDA=1   (nvcc -O3 -std=c++17 -arch=native; links cudart, cublas)
 // Test:  ./test_ops    (compares every op with the CPU implementation)
@@ -105,10 +108,22 @@ bool available() { return st().ok; }
 const char* device_name() { return st().name.c_str(); }
 size_t device_memory() { return st().memory; }
 
+namespace {
+// Size classes: round up to the next 1/8 of a power of two (at most 12.5%
+// waste), so blocks freed by one call are reused by the next similar one.
+size_t size_class(size_t bytes) {
+    bytes = std::max<size_t>(bytes, 256);
+    size_t p = 256;
+    while (p < bytes) p <<= 1;
+    const size_t step = std::max<size_t>(256, p / 8);
+    return (bytes + step - 1) / step * step;
+}
+}  // namespace
+
 void* malloc(size_t bytes) {
     State& s = st();
     if (!s.ok) throw std::runtime_error("CUDA device not available");
-    bytes = (std::max<size_t>(bytes, 1) + 255) & ~(size_t)255;
+    bytes = size_class(bytes);
     {
         std::lock_guard<std::mutex> lk(s.mutex);
         auto it = s.free_lists.find(bytes);
@@ -152,8 +167,11 @@ void free(void* p) {
 
 void upload(void* dst, const void* src, size_t bytes) { check(cudaMemcpy(dst, src, bytes, cudaMemcpyHostToDevice), "upload"); }
 void download(void* dst, const void* src, size_t bytes) { check(cudaMemcpy(dst, src, bytes, cudaMemcpyDeviceToHost), "download"); }
-void copy(void* dst, const void* src, size_t bytes) { check(cudaMemcpy(dst, src, bytes, cudaMemcpyDeviceToDevice), "copy"); }
-void zero(void* dst, size_t bytes) { check(cudaMemset(dst, 0, bytes), "memset"); }
+// Device-side copies and fills are queued on the stream without waiting.
+void copy(void* dst, const void* src, size_t bytes) {
+    check(cudaMemcpyAsync(dst, src, bytes, cudaMemcpyDeviceToDevice, 0), "copy");
+}
+void zero(void* dst, size_t bytes) { check(cudaMemsetAsync(dst, 0, bytes, 0), "memset"); }
 void synchronize() { check(cudaDeviceSynchronize(), "synchronize"); }
 
 // ---------------------------------------------------------------------------
@@ -169,28 +187,45 @@ __device__ inline uint16_t f32_to_bf16_d(float f) {
     return (uint16_t)(bits >> 16);
 }
 
-// Block-wide reductions over blockDim.x threads (a power of two <= 1024).
-__device__ double block_sum(double v) {
-    __shared__ double sh[1024];
-    sh[threadIdx.x] = v;
+// Block-wide reductions in float32 with warp shuffles: one shuffle tree per
+// warp, then one over the warp results. blockDim.x must be a multiple of 32
+// (every launch here uses 32 to 1024 threads). Float32 is accurate enough:
+// each thread accumulates a strided partial sum first, so the tree adds at
+// most a few thousand partials, and double precision runs at 1/32 to 1/64 of
+// float speed on consumer GPUs.
+__device__ inline float warp_sum(float v) {
+    for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
+    return v;
+}
+__device__ inline float warp_max(float v) {
+    for (int o = 16; o > 0; o >>= 1) v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v, o));
+    return v;
+}
+__device__ float block_sum(float v) {
+    __shared__ float sh[32];
+    const unsigned lane = threadIdx.x & 31u, warp = threadIdx.x >> 5;
+    v = warp_sum(v);
+    if (lane == 0) sh[warp] = v;
     __syncthreads();
-    for (unsigned s = blockDim.x / 2; s > 0; s >>= 1) {
-        if (threadIdx.x < s) sh[threadIdx.x] += sh[threadIdx.x + s];
-        __syncthreads();
-    }
-    double r = sh[0];
+    v = threadIdx.x < (blockDim.x >> 5) ? sh[lane] : 0.0f;
+    if (warp == 0) v = warp_sum(v);
+    if (threadIdx.x == 0) sh[0] = v;
+    __syncthreads();
+    const float r = sh[0];
     __syncthreads();
     return r;
 }
 __device__ float block_max(float v) {
-    __shared__ float sh[1024];
-    sh[threadIdx.x] = v;
+    __shared__ float sh[32];
+    const unsigned lane = threadIdx.x & 31u, warp = threadIdx.x >> 5;
+    v = warp_max(v);
+    if (lane == 0) sh[warp] = v;
     __syncthreads();
-    for (unsigned s = blockDim.x / 2; s > 0; s >>= 1) {
-        if (threadIdx.x < s) sh[threadIdx.x] = fmaxf(sh[threadIdx.x], sh[threadIdx.x + s]);
-        __syncthreads();
-    }
-    float r = sh[0];
+    v = threadIdx.x < (blockDim.x >> 5) ? sh[lane] : -3.0e38f;
+    if (warp == 0) v = warp_max(v);
+    if (threadIdx.x == 0) sh[0] = v;
+    __syncthreads();
+    const float r = sh[0];
     __syncthreads();
     return r;
 }
@@ -243,18 +278,18 @@ __global__ void k_group_norm(const float* x, float* y, int64_t C, int64_t HW, in
     const int64_t n = blockIdx.x / groups, g = blockIdx.x % groups, cg = C / groups, len = cg * HW;
     const float* p = x + (n * C + g * cg) * HW;
     float* q = y + (n * C + g * cg) * HW;
-    double s = 0;
+    float s = 0;
     for (int64_t i = threadIdx.x; i < len; i += blockDim.x) s += p[i];
-    const double mean = block_sum(s) / (double)len;
-    double v = 0;
+    const float mean = block_sum(s) / (float)len;
+    float v = 0;
     for (int64_t i = threadIdx.x; i < len; i += blockDim.x) {
-        double d = p[i] - mean;
+        const float d = p[i] - mean;
         v += d * d;
     }
-    const float rstd = (float)(1.0 / sqrt(block_sum(v) / (double)len + (double)eps));
+    const float rstd = rsqrtf(block_sum(v) / (float)len + eps);
     for (int64_t i = threadIdx.x; i < len; i += blockDim.x) {
         const int64_t c = g * cg + i / HW;
-        q[i] = ((float)(p[i] - mean)) * rstd * gamma[c] + beta[c];
+        q[i] = (p[i] - mean) * rstd * gamma[c] + beta[c];
     }
 }
 
@@ -262,20 +297,20 @@ __global__ void k_group_norm(const float* x, float* y, int64_t C, int64_t HW, in
 __global__ void k_row_norm(const float* x, float* y, int64_t C, const float* gamma, const float* beta, float eps, bool rms) {
     const float* p = x + (int64_t)blockIdx.x * C;
     float* q = y + (int64_t)blockIdx.x * C;
-    double mean = 0;
+    float mean = 0;
     if (!rms) {
-        double s = 0;
+        float s = 0;
         for (int64_t i = threadIdx.x; i < C; i += blockDim.x) s += p[i];
-        mean = block_sum(s) / (double)C;
+        mean = block_sum(s) / (float)C;
     }
-    double v = 0;
+    float v = 0;
     for (int64_t i = threadIdx.x; i < C; i += blockDim.x) {
-        double d = p[i] - mean;
+        const float d = p[i] - mean;
         v += d * d;
     }
-    const float rstd = (float)(1.0 / sqrt(block_sum(v) / (double)C + (double)eps));
+    const float rstd = rsqrtf(block_sum(v) / (float)C + eps);
     for (int64_t i = threadIdx.x; i < C; i += blockDim.x) {
-        float o = (float)(p[i] - mean) * rstd;
+        float o = (p[i] - mean) * rstd;
         if (gamma) o *= gamma[i];
         if (beta) o += beta[i];
         q[i] = o;
@@ -284,9 +319,9 @@ __global__ void k_row_norm(const float* x, float* y, int64_t C, const float* gam
 
 __global__ void k_rms_norm_heads(float* x, int64_t dim, const float* gamma, float eps) {
     float* p = x + (int64_t)blockIdx.x * dim;
-    double ss = 0;
-    for (int64_t i = threadIdx.x; i < dim; i += blockDim.x) ss += (double)p[i] * p[i];
-    const float rstd = (float)(1.0 / sqrt(block_sum(ss) / (double)dim + (double)eps));
+    float ss = 0;
+    for (int64_t i = threadIdx.x; i < dim; i += blockDim.x) ss += p[i] * p[i];
+    const float rstd = rsqrtf(block_sum(ss) / (float)dim + eps);
     for (int64_t i = threadIdx.x; i < dim; i += blockDim.x) p[i] = p[i] * rstd * (gamma ? gamma[i] : 1.0f);
 }
 
@@ -311,20 +346,22 @@ __global__ void k_rope(float* x, int64_t NS, int64_t S, int64_t inner, int64_t d
     }
 }
 
-__global__ void k_softmax_rows(float* x, int64_t cols, float scale, bool causal) {
+// One block per row. `period` is the number of query rows per matrix, so a
+// stack of per-head score matrices gets the causal mask row by row.
+__global__ void k_softmax_rows(float* x, int64_t cols, float scale, bool causal, int64_t period) {
     const int64_t r = blockIdx.x;
     float* p = x + r * cols;
-    const int64_t valid = causal ? min(cols, r + 1) : cols;
+    const int64_t valid = causal ? min(cols, (r % period) + 1) : cols;
     float m = -3.0e38f;
     for (int64_t j = threadIdx.x; j < valid; j += blockDim.x) m = fmaxf(m, p[j] * scale);
     m = block_max(m);
-    double s = 0;
+    float s = 0;
     for (int64_t j = threadIdx.x; j < valid; j += blockDim.x) {
         const float e = expf(p[j] * scale - m);
         p[j] = e;
         s += e;
     }
-    const float inv = (float)(1.0 / block_sum(s));
+    const float inv = 1.0f / block_sum(s);
     for (int64_t j = threadIdx.x; j < valid; j += blockDim.x) p[j] *= inv;
     for (int64_t j = valid + threadIdx.x; j < cols; j += blockDim.x) p[j] = 0.0f;
 }
@@ -344,7 +381,8 @@ __global__ void k_unary(float* x, int64_t n, int kind) {
         const float v = x[i];
         if (kind == 0) x[i] = v / (1.0f + expf(-v));
         else if (kind == 1) x[i] = 0.5f * v * (1.0f + erff(v * 0.70710678118654752f));
-        else x[i] = v / (1.0f + expf(-1.702f * v));
+        else if (kind == 2) x[i] = v / (1.0f + expf(-1.702f * v));
+        else x[i] = tanhf(v);
     }
 }
 __global__ void k_add(float* a, const float* b, int64_t n) {
@@ -441,6 +479,18 @@ void gemm_nt_bf16(int64_t M, int64_t N, int64_t K, const float* A, int64_t lda, 
 void conv2d(const float* x, int64_t N, int64_t Cin, int64_t H, int64_t W, const float* w, int64_t Cout, int64_t kh,
             int64_t kw, const float* bias, int stride, int pad, float* out, int64_t Ho, int64_t Wo) {
     const int64_t K = Cin * kh * kw, HW = Ho * Wo;
+    if (kh == 1 && kw == 1 && stride == 1 && pad == 0) {
+        // A 1x1 convolution is out[Cout, HW] = W[Cout, Cin] * x[Cin, HW]: no im2col.
+        for (int64_t n = 0; n < N; ++n) {
+            float* o = out + n * Cout * HW;
+            sgemm_nn(Cout, HW, Cin, w, Cin, x + n * Cin * H * W, HW, o, HW, 0.0f);
+            if (bias) {
+                k_add_bias_rows<<<grid_for(Cout * HW), kThreads>>>(o, HW, Cout, HW, bias);
+                launched("add_bias_rows");
+            }
+        }
+        return;
+    }
     const int64_t chunk = std::max<int64_t>(1, std::min<int64_t>(HW, (int64_t(1) << 26) / K));  // <= 256 MB of columns
     Scratch cols((size_t)(chunk * K) * sizeof(float));
     for (int64_t n = 0; n < N; ++n) {
@@ -493,25 +543,46 @@ void rope(float* x, int64_t N, int64_t S, int64_t inner, int64_t dim, const floa
 
 void softmax_rows(float* x, int64_t rows, int64_t cols, float scale, bool causal) {
     if (rows <= 0) return;
-    k_softmax_rows<<<(unsigned)rows, kThreads>>>(x, cols, scale, causal);
+    k_softmax_rows<<<(unsigned)rows, kThreads>>>(x, cols, scale, causal, rows);
     launched("softmax_rows");
 }
 
 void attention(const float* q, const float* k, const float* v, float* out, int64_t N, int64_t Sq, int64_t Skv, int heads,
                int kv_heads, int64_t d, bool causal) {
     const int64_t inner = heads * d, kv_inner = (int64_t)kv_heads * d, group = heads / kv_heads;
-    const float scale = 1.0f / sqrtf((float)d);
-    Scratch scores((size_t)(Sq * Skv) * sizeof(float));
+    const float scale = 1.0f / sqrtf((float)d), one = 1.0f, zero_f = 0.0f;
+    // Query head h = kvh * group + j uses key/value head kvh. For a fixed j the
+    // heads kvh = 0..kv_heads-1 are evenly strided in q, k, v and out, so they
+    // form one strided batch: q and out step by group*d, k and v by d.
+    // Batches are chunked so the score buffer stays under SD_CUDA_ATTN_MB.
+    static const size_t budget = [] {
+        const char* e = std::getenv("SD_CUDA_ATTN_MB");
+        return (size_t)(e ? std::max(64, std::atoi(e)) : 1024) << 20;
+    }();
+    const size_t per_head = (size_t)(Sq * Skv) * sizeof(float);
+    const int64_t chunk = std::max<int64_t>(1, std::min<int64_t>(kv_heads, (int64_t)(budget / per_head)));
+    Scratch scores(per_head * (size_t)chunk);
     for (int64_t n = 0; n < N; ++n)
-        for (int h = 0; h < heads; ++h) {
-            const int64_t kvh = h / group;
-            const float* qh = q + n * Sq * inner + h * d;
-            const float* kh = k + n * Skv * kv_inner + kvh * d;
-            const float* vh = v + n * Skv * kv_inner + kvh * d;
-            sgemm_nt(Sq, Skv, d, qh, inner, kh, kv_inner, scores.f(), Skv, 0.0f);
-            softmax_rows(scores.f(), Sq, Skv, scale, causal);
-            sgemm_nn(Sq, d, Skv, scores.f(), Skv, vh, kv_inner, out + n * Sq * inner + h * d, inner, 0.0f);
-        }
+        for (int64_t j = 0; j < group; ++j)
+            for (int64_t h0 = 0; h0 < kv_heads; h0 += chunk) {
+                const int64_t B = std::min<int64_t>(chunk, kv_heads - h0);
+                const float* qb = q + n * Sq * inner + (h0 * group + j) * d;
+                const float* kb = k + n * Skv * kv_inner + h0 * d;
+                const float* vb = v + n * Skv * kv_inner + h0 * d;
+                float* ob = out + n * Sq * inner + (h0 * group + j) * d;
+                // scores_b[Sq, Skv] = Q_b K_b^T  (column-major view: S^T = K Q^T)
+                check(cublasSgemmStridedBatched(blas(), CUBLAS_OP_T, CUBLAS_OP_N, (int)Skv, (int)Sq, (int)d, &one, kb,
+                                                (int)kv_inner, d, qb, (int)inner, group * d, &zero_f, scores.f(), (int)Skv,
+                                                Sq * Skv, (int)B),
+                      "attention scores");
+                k_softmax_rows<<<(unsigned)(B * Sq), kThreads>>>(scores.f(), Skv, scale, causal, Sq);
+                launched("attention softmax");
+                // out_b[Sq, d] = P_b V_b  (column-major view: O^T = V^T P^T)
+                check(cublasSgemmStridedBatched(blas(), CUBLAS_OP_N, CUBLAS_OP_N, (int)d, (int)Sq, (int)Skv, &one, vb,
+                                                (int)kv_inner, d, scores.f(), (int)Skv, Sq * Skv, &zero_f, ob, (int)inner,
+                                                group * d, (int)B),
+                      "attention values");
+            }
 }
 
 void geglu(const float* x, float* y, int64_t rows, int64_t D) {
@@ -523,6 +594,7 @@ void swiglu(const float* g, const float* u, float* y, int64_t n) {
     launched("swiglu");
 }
 void silu(float* x, int64_t n) { k_unary<<<grid_for(n), kThreads>>>(x, n, 0); launched("silu"); }
+void tanh(float* x, int64_t n) { k_unary<<<grid_for(n), kThreads>>>(x, n, 3); launched("tanh"); }
 void gelu(float* x, int64_t n) { k_unary<<<grid_for(n), kThreads>>>(x, n, 1); launched("gelu"); }
 void quick_gelu(float* x, int64_t n) { k_unary<<<grid_for(n), kThreads>>>(x, n, 2); launched("quick_gelu"); }
 void add(float* a, const float* b, int64_t n) { k_add<<<grid_for(n), kThreads>>>(a, b, n); launched("add"); }

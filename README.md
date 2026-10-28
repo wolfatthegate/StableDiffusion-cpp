@@ -299,10 +299,33 @@ first step includes cuBLAS warm-up. A 16 GB card fits Z-Image at 1024x1024;
 8 GB fits SD 1.5. `SD_CUDA_TF32=1` allows TF32 tensor cores for the float32
 products (SD 1.5), roughly twice as fast with about 1e-3 relative error.
 
+How the backend is tuned:
+
+- Attention runs all heads of a layer as strided batched GEMMs (one launch
+  for the scores, one softmax, one for the weighted sum) instead of three
+  launches per head; grouped-query heads are batched per group. The score
+  buffer is chunked to stay under 1 GB (`SD_CUDA_ATTN_MB` changes the cap).
+- Norms and softmax reduce in float32 with warp shuffles; double-precision
+  arithmetic runs at 1/32 to 1/64 speed on consumer GPUs.
+- The Z-Image modulation (scales and tanh gates for every block) is computed
+  on the GPU, so a step has no host round trips besides the latent.
+- 1x1 convolutions are a single GEMM with no im2col copy.
+- The allocator reuses freed blocks by size class (at most 12.5% padding),
+  so `cudaMalloc`, which stalls the whole device, is rare after the first
+  step. Device copies and fills are asynchronous.
+
 Validation: `./test_ops` runs every op on both devices with the same inputs
-and prints a `cuda <op>  max|err|` line for each. As an end-to-end check,
-the same prompt and seed with and without `--device cpu` should give images
-that differ only by float rounding.
+and prints a `cuda <op>  max|err|` line for each, then two throughput
+benchmarks (a bf16 projection and a full attention layer at Z-Image's
+1024x1024 size) in TFLOP/s. The reference tests also run on the GPU:
+
+```sh
+SD_TEST_DEVICE=cuda ./test_zimage    # one transformer forward against PyTorch, plus its time
+SD_TEST_DEVICE=cuda ./test_vae
+```
+
+As an end-to-end check, the same prompt and seed with and without
+`--device cpu` should give images that differ only by float rounding.
 
 Status: the backend was written and parse-checked on a Mac without an
 NVIDIA GPU (`make cuda-syntax-check` runs that check with clang and
